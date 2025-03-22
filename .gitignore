@@ -97,3 +97,7 @@ celerybeat-schedule
 # Rope project settings
 .ropeproject
 Resources/
+data/
+# Tests
+tests.txt
+MCP_Documentation_Guide.md

@@ -56,9 +56,16 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                 with PILImage.open(BytesIO(data)) as img:
                     width, height = img.size
                     logger.debug(f"Original image dimensions from {image_source}: {width}x{height}")
+                    logger.debug(f"Image format from PIL: {img.format}, mode: {img.mode}")
             except Exception as e:
                 logger.debug(f"Could not determine dimensions for {image_source}: {e}")
-            return Image(data=data, format=content_type.split('/')[-1])
+            
+            # Ensure content_type is valid and doesn't include 'image/'
+            if content_type.startswith('image/'):
+                content_type = content_type.split('/')[-1]
+            
+            logger.debug(f"Creating Image object with format: {content_type}")
+            return Image(data=data, format=content_type)
 
         # For large images, save to temp file and process
         temp_path = os.path.join(TEMP_DIR, f"temp_image_{hash(image_source)}." + content_type.split('/')[-1])
@@ -69,6 +76,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
             with PILImage.open(temp_path) as img:
                 orig_width, orig_height = img.size
                 logger.debug(f"Original image dimensions from {image_source}: {orig_width}x{orig_height}")
+                logger.debug(f"Large image format from PIL: {img.format}, mode: {img.mode}")
                 
                 if img.mode in ('RGBA', 'P'):
                     img = img.convert('RGB')
@@ -87,6 +95,7 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
                                 logger.debug(f"Processed image dimensions from {image_source}: {new_width}x{new_height} (quality={quality})")
                         except Exception as e:
                             logger.debug(f"Could not determine processed dimensions for {image_source}: {e}")
+                        logger.debug(f"Returning processed image with format: jpeg")
                         return Image(data=img_byte_arr.getvalue(), format='jpeg')
                     
                     if quality > 30:
@@ -124,9 +133,22 @@ async def process_local_image(file_path: str, ctx: Context) -> Dict[str, Any]:
         
         # Determine content type based on file extension
         _, ext = os.path.splitext(file_path)
-        content_type = ext[1:].lower() if ext else "jpeg"  # Default to jpeg if no extension
+        ext = ext[1:].lower() if ext else "jpeg"  # Default to jpeg if no extension
         
-        logger.debug(f"Processing local image from {file_path}")
+        # Map extension to proper MIME type
+        mime_type_map = {
+            "jpg": "jpeg",
+            "jpeg": "jpeg",
+            "png": "png",
+            "gif": "gif",
+            "bmp": "bmp",
+            "webp": "webp",
+            "tiff": "tiff",
+            "tif": "tiff"
+        }
+        
+        content_type = mime_type_map.get(ext, "jpeg")  # Default to jpeg if unknown extension
+        logger.debug(f"Local image {file_path} has extension '{ext}', mapped to content type '{content_type}'")
         
         # For large files, read and process directly without loading entire file into memory
         file_size = os.path.getsize(file_path)
@@ -164,6 +186,7 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
         with PILImage.open(file_path) as img:
             orig_width, orig_height = img.size
             logger.debug(f"Original large local image dimensions from {file_path}: {orig_width}x{orig_height}")
+            logger.debug(f"Original image format: {img.format}, mode: {img.mode}")
             
             if img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
@@ -228,7 +251,13 @@ async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) 
             return {"url": url, "error": error_msg}
 
         logger.debug(f"Fetched image from {url} with {len(response.content)} bytes")
-        processed_image = await process_image_data(response.content, content_type.split('/')[-1], url, ctx)
+        logger.debug(f"Content-Type from server: {content_type}")
+        
+        # Extract the format from content-type
+        format_type = content_type.split('/')[-1]
+        logger.debug(f"Extracted format type: {format_type}")
+        
+        processed_image = await process_image_data(response.content, format_type, url, ctx)
         
         if processed_image is None:
             return {"url": url, "error": "Failed to process image"}
