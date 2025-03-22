@@ -67,7 +67,7 @@ To add this MCP server to Windsurf:
   "mcpServers": {
     "image": {
       "command": "uv",
-      "args": ["--directory", "D:\\Tools\\mcp-image", "run", "mcp_image.py"]
+        "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
     }
   }
 }
@@ -84,7 +84,7 @@ To add this MCP server to Cursor:
   "mcpServers": {
     "image": {
       "command": "uv",
-      "args": ["--directory", "D:\\Tools\\mcp-image", "run", "mcp_image.py"]
+      "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
     }
   }
 }
