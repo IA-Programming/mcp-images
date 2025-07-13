@@ -73,42 +73,79 @@ async def process_image_data(data: bytes, content_type: str, image_source: str, 
             f.write(data)
         
         try:
+            # First pass: get dimensions and basic info
             with PILImage.open(temp_path) as img:
                 orig_width, orig_height = img.size
+                orig_format = img.format
+                orig_mode = img.mode
                 logger.debug(f"Original image dimensions from {image_source}: {orig_width}x{orig_height}")
-                logger.debug(f"Large image format from PIL: {img.format}, mode: {img.mode}")
-                
+                logger.debug(f"Large image format from PIL: {orig_format}, mode: {orig_mode}")
+            
+            # Calculate optimal resize factor if image is very large
+            max_dimension = max(orig_width, orig_height)
+            initial_scale = 1.0
+            if max_dimension > 3000:
+                initial_scale = 3000 / max_dimension
+                logger.debug(f"Very large image detected ({max_dimension}px), will start with scale factor: {initial_scale}")
+            
+            # Second pass: process the image
+            with PILImage.open(temp_path) as img:
                 if img.mode in ('RGBA', 'P'):
                     img = img.convert('RGB')
                 
-                width, height = img.size
-                new_img = img
+                # Apply initial scale if needed
+                if initial_scale < 1.0:
+                    width = int(orig_width * initial_scale)
+                    height = int(orig_height * initial_scale)
+                    img = img.resize((width, height), PILImage.LANCZOS)
+                else:
+                    width, height = img.size
+                
                 quality = 85
+                scale_factor = 1.0
                 
                 while True:
                     img_byte_arr = BytesIO()
-                    new_img.save(img_byte_arr, format='JPEG', quality=quality)
-                    if len(img_byte_arr.getvalue()) <= 1048576:
-                        try:
-                            with PILImage.open(BytesIO(img_byte_arr.getvalue())) as processed_img:
-                                new_width, new_height = processed_img.size
-                                logger.debug(f"Processed image dimensions from {image_source}: {new_width}x{new_height} (quality={quality})")
-                        except Exception as e:
-                            logger.debug(f"Could not determine processed dimensions for {image_source}: {e}")
-                        logger.debug(f"Returning processed image with format: jpeg")
-                        return Image(data=img_byte_arr.getvalue(), format='jpeg')
                     
-                    if quality > 30:
-                        quality -= 10
+                    # Create a copy for this iteration to avoid accumulating transforms
+                    if scale_factor < 1.0:
+                        current_width = int(width * scale_factor)
+                        current_height = int(height * scale_factor)
+                        current_img = img.resize((current_width, current_height), PILImage.LANCZOS)
                     else:
-                        width = int(width * 0.8)
-                        height = int(height * 0.8)
-                        if width < 200 or height < 200:
+                        current_img = img
+                        current_width, current_height = width, height
+                    
+                    current_img.save(img_byte_arr, format='JPEG', quality=quality, optimize=True)
+                    processed_data = img_byte_arr.getvalue()
+                    
+                    # Clean up the temporary image if we created one
+                    if scale_factor < 1.0 and hasattr(current_img, 'close'):
+                        current_img.close()
+                    
+                    # Target 800KB to leave buffer for any MCP overhead
+                    if len(processed_data) <= 819200:  # 800KB
+                        logger.debug(f"Processed image dimensions from {image_source}: {current_width}x{current_height} (quality={quality})")
+                        logger.debug(f"Returning processed image with format: jpeg, size: {len(processed_data)} bytes")
+                        return Image(data=processed_data, format='jpeg')
+                    
+                    # Try reducing quality first
+                    if quality > 20:
+                        quality -= 10
+                        logger.debug(f"Reducing quality to {quality} for {image_source}, current size: {len(processed_data)} bytes")
+                    else:
+                        # Then try scaling down
+                        scale_factor *= 0.8
+                        if current_width * scale_factor < 200 or current_height * scale_factor < 200:
                             ctx.error("Unable to compress image to acceptable size while maintaining quality")
-                            logger.error(f"Failed processing image from {image_source}: dimensions {width}x{height} too small")
+                            logger.error(f"Failed processing image from {image_source}: dimensions too small")
                             return None
-                        new_img = img.resize((width, height), PILImage.LANCZOS)
-                        quality = 85
+                        logger.debug(f"Applying scale factor {scale_factor} to image from {image_source}")
+                        quality = 85  # Reset quality when changing size
+        except MemoryError as e:
+            ctx.error(f"Out of memory processing large image: {str(e)}")
+            logger.error(f"MemoryError processing image from {image_source}: {str(e)}")
+            return None
         except Exception as e:
             ctx.error(f"Image processing error: {str(e)}")
             logger.exception(f"Exception processing image from {image_source}")
@@ -182,45 +219,83 @@ async def process_large_local_image(file_path: str, content_type: str, ctx: Cont
         # Create a temporary file path for processing
         temp_path = os.path.join(TEMP_DIR, f"temp_local_{os.path.basename(file_path)}")
         
-        # Open the original image with PIL directly
+        # First pass: get dimensions and basic info
         with PILImage.open(file_path) as img:
             orig_width, orig_height = img.size
+            orig_format = img.format
+            orig_mode = img.mode
             logger.debug(f"Original large local image dimensions from {file_path}: {orig_width}x{orig_height}")
-            logger.debug(f"Original image format: {img.format}, mode: {img.mode}")
-            
+            logger.debug(f"Original image format: {orig_format}, mode: {orig_mode}")
+        
+        # Calculate optimal resize factor if image is very large
+        max_dimension = max(orig_width, orig_height)
+        initial_scale = 1.0
+        if max_dimension > 4000:
+            initial_scale = 4000 / max_dimension
+            logger.debug(f"Very large image detected, will start with scale factor: {initial_scale}")
+        
+        # Second pass: process the image
+        with PILImage.open(file_path) as img:
             if img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
             
-            width, height = img.size
-            new_img = img
-            quality = 85
+            # Apply initial scale if needed
+            if initial_scale < 1.0:
+                width = int(orig_width * initial_scale)
+                height = int(orig_height * initial_scale)
+                img = img.resize((width, height), PILImage.LANCZOS)
+            else:
+                width, height = img.size
+            
+            quality = 75  # Start with lower quality for large images
+            scale_factor = 1.0
             
             while True:
                 # Save the processed image to a temporary BytesIO
                 img_byte_arr = BytesIO()
-                new_img.save(img_byte_arr, format='JPEG', quality=quality)
+                
+                # Create a copy for this iteration to avoid accumulating transforms
+                if scale_factor < 1.0:
+                    current_width = int(width * scale_factor)
+                    current_height = int(height * scale_factor)
+                    current_img = img.resize((current_width, current_height), PILImage.LANCZOS)
+                else:
+                    current_img = img
+                    current_width, current_height = width, height
+                
+                current_img.save(img_byte_arr, format='JPEG', quality=quality, optimize=True)
                 processed_data = img_byte_arr.getvalue()
                 
-                if len(processed_data) <= 1048576:
-                    logger.debug(f"Successfully compressed large local image {file_path} to {len(processed_data)} bytes (quality={quality})")
+                # Clean up the temporary image if we created one
+                if scale_factor < 1.0 and hasattr(current_img, 'close'):
+                    current_img.close()
+                
+                # Target 800KB to leave buffer for any MCP overhead
+                if len(processed_data) <= 819200:  # 800KB
+                    logger.debug(f"Successfully compressed large local image {file_path} to {len(processed_data)} bytes (quality={quality}, dimensions={current_width}x{current_height})")
                     return {"path": file_path, "image": Image(data=processed_data, format='jpeg')}
                 
+                # Try reducing quality first
                 if quality > 30:
                     quality -= 10
                     logger.debug(f"Reducing quality to {quality} for {file_path}")
                 else:
-                    width = int(width * 0.8)
-                    height = int(height * 0.8)
-                    if width < 200 or height < 200:
+                    # Then try scaling down
+                    scale_factor *= 0.8
+                    if current_width * scale_factor < 200 or current_height * scale_factor < 200:
                         error_msg = f"Unable to compress large local image {file_path} to acceptable size while maintaining quality"
                         ctx.error(error_msg)
                         logger.error(error_msg)
                         return {"path": file_path, "error": error_msg}
                     
-                    logger.debug(f"Resizing large local image {file_path} to {width}x{height}")
-                    new_img = img.resize((width, height), PILImage.LANCZOS)
-                    quality = 85
+                    logger.debug(f"Applying scale factor {scale_factor} to image {file_path}")
+                    quality = 85  # Reset quality when changing size
     
+    except MemoryError as e:
+        error_msg = f"Out of memory processing large local image {file_path}: {str(e)}"
+        ctx.error(error_msg)
+        logger.error(error_msg)
+        return {"path": file_path, "error": error_msg}
     except Exception as e:
         error_msg = f"Error processing large local image {file_path}: {str(e)}"
         ctx.error(error_msg)
