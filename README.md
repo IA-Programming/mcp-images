@@ -1,6 +1,10 @@
 # MCP Server - Image
 A Model Context Protocol (MCP) server that provides tools for fetching and processing images from URLs, local file paths, and numpy arrays. The server includes a tool called fetch_images that returns images as base64-encoded strings along with their MIME types.
 
+<a href="https://glama.ai/mcp/servers/@IA-Programming/mcp-images">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@IA-Programming/mcp-images/badge" alt="Image Server MCP server" />
+</a>
+
 ## Support Us
 
 If you find this project helpful and would like to support future projects, consider buying us a coffee! Your support helps us continue building innovative AI solutions.
