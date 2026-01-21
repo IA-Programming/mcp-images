@@ -93,7 +93,7 @@ To add this MCP server to Cursor:
 ## Available Tools
 The server provides the following tools:
 
-[fetch_images](mcp_image.py#L318): Fetch and process images from URLs or local file paths
+[fetch_images](mcp_image.py#L318): Fetch and process images from URLs or local file paths *(read-only tool; safe to call without modifying state)*
 Parameters:
 image_sources: List of URLs or file paths to images
 Returns:

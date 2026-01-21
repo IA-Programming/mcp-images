@@ -1,11 +1,19 @@
 [project]
 name = "mcp-image"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.1.1"
+description = "FastMCP server that fetches, compresses, and returns images"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.2.1",
+    "mcp[cli]>=1.25.0",
     "pillow>=11.1.0",
 ]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+py-modules = ["mcp_image"]

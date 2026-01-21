@@ -10,6 +10,7 @@ from datetime import datetime
 from PIL import Image as PILImage
 from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP, Image, Context
+from mcp.types import ToolAnnotations
 from typing import List, Dict, Any, Union, Optional
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
@@ -320,18 +321,49 @@ async def fetch_single_image(url: str, client: httpx.AsyncClient, ctx: Context) 
         response.raise_for_status()
         
         content_type = response.headers.get('content-type', '')
-        if not content_type.startswith('image/'):
-            error_msg = f"Not an image (got {content_type})"
-            ctx.error(error_msg)
-            return {"url": url, "error": error_msg}
+        logger.debug(
+            f"Fetched URL {url} status={response.status_code} content-type={content_type!r} bytes={len(response.content)}"
+        )
 
-        logger.debug(f"Fetched image from {url} with {len(response.content)} bytes")
-        logger.debug(f"Content-Type from server: {content_type}")
-        
-        # Extract the format from content-type
-        format_type = content_type.split('/')[-1]
-        logger.debug(f"Extracted format type: {format_type}")
-        
+        # Determine image format
+        format_type: str
+        if content_type.startswith('image/'):
+            # Normal case: server returned an image content-type
+            format_type = content_type.split('/')[-1]
+            logger.debug(f"Extracted format type from Content-Type: {format_type}")
+        else:
+            # Special-case Telegram file API: it may return application/octet-stream
+            # even for real images. In this case infer format from URL path.
+            if parsed.netloc.endswith('api.telegram.org') and '/file/bot' in (parsed.path or ''):
+                path = parsed.path or ''
+                ext = ''
+                dot = path.rfind('.')
+                if dot != -1:
+                    ext = path[dot + 1 :].lower()
+                # Map extension to a sensible image format, default to jpeg
+                mime_type_map = {
+                    'jpg': 'jpeg',
+                    'jpeg': 'jpeg',
+                    'png': 'png',
+                    'gif': 'gif',
+                    'bmp': 'bmp',
+                    'webp': 'webp',
+                    'tiff': 'tiff',
+                    'tif': 'tiff',
+                }
+                format_type = mime_type_map.get(ext, 'jpeg')
+                logger.debug(
+                    "Treating Telegram file URL %s as image with inferred format '%s' "
+                    "(original Content-Type=%r)",
+                    url,
+                    format_type,
+                    content_type,
+                )
+            else:
+                error_msg = f"Not an image (got {content_type})"
+                ctx.error(error_msg)
+                return {"url": url, "error": error_msg}
+
         processed_image = await process_image_data(response.content, format_type, url, ctx)
         
         if processed_image is None:
@@ -389,7 +421,7 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     
     return ordered_results
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True), structured_output=False)
 async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | None]:
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
