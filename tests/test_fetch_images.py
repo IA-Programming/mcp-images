@@ -255,6 +255,8 @@ def svg_support():
     try:
         import cairosvg  # noqa: F401
     except (ImportError, OSError) as e:
+        if os.environ.get("REQUIRE_SVG"):
+            pytest.fail(f"REQUIRE_SVG is set but SVG support is unavailable: {e}")
         pytest.skip(f"SVG support unavailable: {e}")
 
 

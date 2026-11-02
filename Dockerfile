@@ -4,7 +4,7 @@ FROM ${PYTHON_IMAGE}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcairo2 \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
+    && pip install --no-cache-dir uv==0.13.6
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
