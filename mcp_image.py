@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import asyncio
+import functools
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -47,7 +49,11 @@ EXIF_TRANSPOSE = {
 PILImage.MAX_IMAGE_PIXELS = None
 USER_AGENT = f"mcp-image/0.2 (https://github.com/IA-Programming/mcp-images) python-httpx/{httpx.__version__}"
 SVG_TARGET_DIMENSION = 1024
-SVG_PROBE_SCALE = 1 / 8
+# Servers often label SVG with generic types, so only these are sniffed for an <svg> root.
+GENERIC_CONTENT_TYPES = {"", "application/octet-stream", "binary/octet-stream", "text/plain", "text/xml", "application/xml"}
+SVG_PROLOG = re.compile(rb"\s*(?:<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>\[]*(?:\[.*?\])?\s*>)", re.DOTALL | re.IGNORECASE)
+SVG_ROOT = re.compile(rb"\s*<(?:[\w.-]+:)?svg[\s/>]", re.IGNORECASE)
+WINDOWS_GTK3_DIR = r"C:\Program Files\GTK3-Runtime Win64\bin"
 
 
 def setup_logging() -> logging.Logger:
@@ -123,31 +129,54 @@ async def read_url(url: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
 
 
 def is_svg(data: bytes, content_type: str) -> bool:
-    if content_type == "image/svg+xml":
+    """True when the server says SVG, or when a generically typed body has an <svg> root element."""
+    if content_type in ("image/svg+xml", "image/svg"):
         return True
-    head = data[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
-    return b"<svg" in head and head.startswith((b"<svg", b"<?xml", b"<!doctype", b"<!--"))
+    if content_type not in GENERIC_CONTENT_TYPES:
+        return False
+    head, pos = data[:65536].removeprefix(b"\xef\xbb\xbf"), 0
+    while match := SVG_PROLOG.match(head, pos):
+        pos = match.end()
+    return SVG_ROOT.match(head, pos) is not None
+
+
+@functools.cache
+def add_windows_cairo_dirs() -> None:
+    """Let cairocffi find a Cairo DLL outside PATH, such as the GTK3 runtime's."""
+    configured = os.environ.get("CAIRO_DLL_DIRS")
+    for directory in configured.split(os.pathsep) if configured else [WINDOWS_GTK3_DIR]:
+        if directory and os.path.isdir(directory):
+            os.add_dll_directory(directory)
+            os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
 
 
 def render_svg(data: bytes, source: str) -> bytes:
     """Rasterize an SVG to PNG with its longer edge near SVG_TARGET_DIMENSION."""
+    if sys.platform == "win32":
+        add_windows_cairo_dirs()
     try:
         import cairosvg
+        from cairosvg.parser import Tree
+        from cairosvg.surface import SVGSurface
     except (ImportError, OSError) as e:
         raise ImageSourceError(
             "SVG support is not installed: install the `mcp-image[svg]` extra and the Cairo library"
         ) from e
     try:
-        # unsafe=False (the default) stops the SVG from pulling in local files or URLs.
-        # A tiny probe render reveals the natural size without allocating a huge surface.
-        probe = cairosvg.svg2png(bytestring=data, scale=SVG_PROBE_SCALE)
-        with PILImage.open(BytesIO(probe)) as img:
-            natural = max(max(img.size) / SVG_PROBE_SCALE, 1)
-        scale = min(max(natural, SVG_TARGET_DIMENSION), MAX_DIMENSION) / natural
+        # Measuring on a vector surface reads the natural size without allocating pixels.
+        # unsafe=False (the default) also stops the SVG from pulling in local files or URLs.
+        surface = SVGSurface(Tree(bytestring=data), None, 96)
+        surface.finish()
+        longest = max(surface.width, surface.height)
+        if longest <= 0:
+            raise ImageSourceError("SVG has no width or height")
+        scale = min(max(longest, SVG_TARGET_DIMENSION), MAX_DIMENSION) / longest
         png = cairosvg.svg2png(bytestring=data, scale=scale)
+    except ImageSourceError:
+        raise
     except Exception as e:
         raise ImageSourceError(f"could not render SVG ({type(e).__name__}: {e})") from e
-    logger.debug("%s: rendered SVG at scale %.2f (%d bytes)", source, scale, len(png))
+    logger.debug("%s: rendered SVG at scale %.4g (%d bytes)", source, scale, len(png))
     return png
 
 

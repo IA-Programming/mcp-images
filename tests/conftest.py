@@ -72,6 +72,8 @@ class Handler(BaseHTTPRequestHandler):
         "/html": (200, "text/html; charset=utf-8", b"<html><body>not an image</body></html>"),
         "/missing": (404, "text/plain", b"nope"),
         "/icon": (200, "image/svg+xml", ICON_SVG),
+        "/icon-as-text": (200, "text/plain", ICON_SVG),
+        "/page-with-svg": (200, "text/html", b"<!doctype html><html><body>" + ICON_SVG + b"</body></html>"),
     }
 
     def do_GET(self):

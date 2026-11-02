@@ -1,5 +1,6 @@
 import base64
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -259,11 +260,48 @@ async def test_svg_from_url(http_server):
 
 
 @pytest.mark.usefixtures("svg_support")
-async def test_huge_svg_is_capped(tmp_path):
+@pytest.mark.usefixtures("svg_support")
+@pytest.mark.parametrize("size", [(20_000, 10_000), (200_000, 200_000)])
+async def test_huge_svg_is_capped_without_rendering_at_full_size(tmp_path, size):
+    w, h = size
     path = tmp_path / "poster.svg"
-    path.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg" width="20000" height="10000"><rect width="20000" height="10000" fill="blue"/></svg>')
+    path.write_bytes(f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><rect width="{w}" height="{h}" fill="blue"/></svg>'.encode())
+    start = time.perf_counter()
     (block,) = (await call_fetch([str(path)])).content
+    assert time.perf_counter() - start < 5
     assert_within_limits(block)
+
+
+@pytest.mark.usefixtures("svg_support")
+@pytest.mark.parametrize("attrs", ['width="400" height="4"', 'width="1" height="1" viewBox="0 0 100 100"'])
+async def test_svgs_with_tiny_declared_sizes_render(tmp_path, attrs):
+    path = tmp_path / "tiny.svg"
+    path.write_bytes(f'<svg xmlns="http://www.w3.org/2000/svg" {attrs}><rect width="100%" height="100%" fill="red"/></svg>'.encode())
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "image"
+    assert max(decode(block).size) == mcp_image.SVG_TARGET_DIMENSION
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_svg_after_a_long_prolog_is_detected(tmp_path):
+    path = tmp_path / "licensed.svg"
+    path.write_bytes(b'<?xml version="1.0"?>\n<!-- ' + b"license text " * 200 + b"-->\n" + ICON_SVG.split(b"\n", 1)[1])
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "image"
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_svg_served_with_a_generic_content_type_is_detected(http_server):
+    (block,) = (await call_fetch([http_server + "/icon-as-text"])).content
+    assert block.type == "image"
+
+
+async def test_html_with_inline_svg_is_not_treated_as_svg(http_server, tmp_path):
+    page = tmp_path / "page.html"
+    page.write_bytes(b"<!doctype html><html><body>" + ICON_SVG + b"</body></html>")
+    result = await call_fetch([http_server + "/page-with-svg", str(page)])
+    assert "not a recognized image (Content-Type: text/html)" in result.content[0].text
+    assert "not a recognized image" in result.content[1].text
 
 
 @pytest.mark.usefixtures("svg_support")
