@@ -28,12 +28,14 @@ FETCH_TIMEOUT = 30.0
 JPEG_QUALITIES = (85, 75, 65, 50, 35)
 PASSTHROUGH_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 LOSSLESS_FORMATS = {"PNG", "GIF", "BMP", "TIFF", "ICO", "PPM", "TGA"}
-USER_AGENT = "mcp-image/0.2 (+https://github.com/IA-Programming/mcp-images)"
+USER_AGENT = f"mcp-image/0.2 (https://github.com/IA-Programming/mcp-images) python-httpx/{httpx.__version__}"
 SVG_TARGET_DIMENSION = 1024
 SVG_PROBE_SCALE = 1 / 8
 
 
 def setup_logging() -> logging.Logger:
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     logger = logging.getLogger("image-mcp")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
