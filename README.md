@@ -1,5 +1,5 @@
 # MCP Server - Image
-A Model Context Protocol (MCP) server that provides tools for fetching and processing images from URLs, local file paths, and numpy arrays. The server includes a tool called fetch_images that returns images as base64-encoded strings along with their MIME types.
+A Model Context Protocol (MCP) server that lets an AI assistant look at images. Its `fetch_images` tool loads images from URLs or local file paths and returns them in a form LLM clients can display, downscaling and recompressing them when needed so they fit client limits.
 
 ## Support Us
 
@@ -14,125 +14,154 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Running the Server](#running-the-server)
-  - [Direct Method](#1-direct-method)
-  - [Configure for Windsurf/Cursor](#2-configure-for-windsurfcursor)
+- [Client Configuration](#client-configuration)
 - [Available Tools](#available-tools)
-  - [Usage Examples](#usage-examples)
-- [Debugging](#debugging)
+- [Configuration](#configuration)
+- [Testing and Debugging](#testing-and-debugging)
 - [Contributing](#contributing)
 - [License](#license)
 
 ## Features
-- Fetch images from URLs (http/https)
-- Load images from local file paths
-- Specialized handling for large local images
-- Automatic image compression for large images (>1MB)
-- Parallel processing of multiple images
-- Proper MIME type mapping for different file extensions
-- Comprehensive error handling and logging
+- Fetch images from `http(s)` URLs (redirects followed) and local paths, including `~/...` and `file://` URIs
+- Detects the real format from the file contents, so wrong extensions and `application/octet-stream` responses (e.g. Telegram's file API) still work
+- Returns JPEG, PNG, GIF and WebP as-is when they are small enough; converts everything else (BMP, TIFF, ...) to PNG or JPEG
+- Downscales to 1568px on the longer edge and keeps each image under ~750 KB (about 1 MB once base64-encoded, the limit Claude Desktop enforces)
+- Keeps transparency (PNG) when possible, applies EXIF rotation
+- Optional SVG support: small icons are rendered large enough to read, and an SVG cannot pull in other local files or URLs
+- Processes multiple images in parallel; a failed source returns a message saying why, in its position in the list
+
 ## Prerequisites
-- Python 3.10+
-- uv package manager (recommended)
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) (recommended)
+- For SVG support only: the native Cairo library
+  - Debian/Ubuntu: `sudo apt install libcairo2`
+  - macOS: `brew install cairo` (on Apple Silicon, also set `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` for the server)
+  - Windows: install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer) and make sure its `bin` folder is on `PATH`
+
 ## Installation
-1. Clone this repository
-2. Create and activate a virtual environment using uv:
 ```bash
-uv venv
-# On Windows:
-.venv\Scripts\activate
-# On Unix/MacOS:
-source .venv/bin/activate
+git clone https://github.com/IA-Programming/mcp-images.git
+cd mcp-images
+uv sync                # core
+uv sync --extra svg    # or: with SVG support
 ```
-3. Install dependencies using uv:
-```bash
-uv pip install -r requirements.txt
-```
+
 ## Running the Server
-There are two ways to run the MCP server:
-
-### 1. Direct Method
-To start the MCP server directly:
+The server speaks MCP over stdio, so normally your MCP client starts it (see below). To run it by hand:
 
 ```bash
-uv run python mcp_image.py
+uv run mcp-image
 ```
-### 2. Configure for Windsurf/Cursor
-#### Windsurf
-To add this MCP server to Windsurf:
 
-1. Edit the configuration file at ~/.codeium/windsurf/mcp_config.json
-2. Add the following configuration:
+Without cloning, straight from GitHub:
+
+```bash
+uvx --from git+https://github.com/IA-Programming/mcp-images mcp-image
+```
+
+With Docker (SVG support included):
+
+```bash
+docker build -t mcp-image .
+docker run -i --rm -v "$HOME/Pictures:/images:ro" mcp-image
+```
+
+Inside the container, local paths refer to the mounted folder, e.g. `/images/photo.jpg`.
+
+## Client Configuration
+Replace `/path/to/mcp-images` with where you cloned the repository. Drop `"--extra", "svg"` if you did not install Cairo.
+
+#### Claude Code
+This repository ships a `.mcp.json`, so Claude Code sessions opened in it pick the server up automatically. To add it to another project:
+
+```bash
+claude mcp add image -- uv run --directory /path/to/mcp-images --extra svg mcp-image
+```
+
+#### Claude Desktop, Cursor, Windsurf
+Add to `claude_desktop_config.json`, Cursor's *Settings → MCP*, or `~/.codeium/windsurf/mcp_config.json`:
 ```json
 {
   "mcpServers": {
     "image": {
       "command": "uv",
-        "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
+      "args": ["run", "--directory", "/path/to/mcp-images", "--extra", "svg", "mcp-image"]
     }
   }
 }
 ```
-#### Cursor
-To add this MCP server to Cursor:
 
-1. Open Cursor and go to *Settings* (Navbar → Cursor Settings)
-2. Navigate to *Features* → *MCP Servers*
-3. Click on + Add New MCP Server
-4. Enter the following configuration:
+#### VS Code
+Add to your user or workspace `mcp.json`:
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "image": {
+      "type": "stdio",
       "command": "uv",
-      "args": ["--directory", "/path/to/mcp-image", "run", "mcp_image.py"]
+      "args": ["run", "--directory", "/path/to/mcp-images", "--extra", "svg", "mcp-image"]
     }
   }
 }
 ```
 
 ## Available Tools
-The server provides the following tools:
+**fetch_images** (read-only): fetch images from URLs or local file paths.
 
-[fetch_images](mcp_image.py#L318): Fetch and process images from URLs or local file paths
 Parameters:
-image_sources: List of URLs or file paths to images
-Returns:
-List of processed images with base64 encoding and MIME types
+- `image_sources` (required): list of URLs or file paths. For one image, pass a one-element list.
+
+Returns one entry per source, in the same order: the image, or a text message explaining why that source failed (for example `Error processing /tmp/a.png: file not found: /tmp/a.png`).
 
 ### Usage Examples
-You can now use commands like:
-
 - "Fetch these images: [list of URLs or file paths]"
-- "Load and process this local image: [file_path]"
+- "Look at ~/Desktop/screenshot.png and tell me what's wrong with the layout"
 
-#### Examples
-```
-# URL-only test
+```json
 [
-  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/70/Chocolate_%28blue_background%29.jpg/400px-Chocolate_%28blue_background%29.jpg",
-  "https://imgs.search.brave.com/Sz7BdlhBoOmU4wZjnUkvgestdwmzOzrfc3GsiMr27Ik/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly9pbWdj/ZG4uc3RhYmxlZGlm/ZnVzaW9ud2ViLmNv/bS8yMDI0LzEwLzE4/LzJmOTY3NTViLTM0/YmQtNDczNi1iNDRh/LWJlMTVmNGM5MDBm/My5qcGc",
-  "https://shigacare.fukushi.shiga.jp/mumeixxx/img/main.png"
-]
-
-# Mixed URL and local file test
-[
-  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/70/Chocolate_%28blue_background%29.jpg/400px-Chocolate_%28blue_background%29.jpg",
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/70/Chocolate_%28blue_background%29.jpg/330px-Chocolate_%28blue_background%29.jpg",
+  "https://upload.wikimedia.org/wikipedia/commons/0/02/SVG_logo.svg",
   "C:\\Users\\username\\Pictures\\image1.jpg",
-  "https://imgs.search.brave.com/Sz7BdlhBoOmU4wZjnUkvgestdwmzOzrfc3GsiMr27Ik/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly9pbWdj/ZG4uc3RhYmxlZGlm/ZnVzaW9ud2ViLmNv/bS8yMDI0LzEwLzE4/LzJmOTY3NTViLTM0/YmQtNDczNi1iNDRh/LWJlMTVmNGM5MDBm/My5qcGc",
-  "C:\\Users\\username\\Pictures\\image2.jpg"
+  "~/Pictures/image2.png"
 ]
 ```
 
-## Debugging
-If you encounter any issues:
+## Configuration
+Optional environment variables:
 
-1. Check that all dependencies are installed correctly
-2. Verify that the server is running and listening for connections
-3. For local image loading issues, ensure the file paths are correct and accessible
-4. For "Unsupported image type" errors, verify the content type handling
-5. Look for any error messages in the server output
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_IMAGE_MAX_DIMENSION` | `1568` | Longest edge, in pixels, of returned images |
+| `MCP_IMAGE_MAX_BYTES` | `750000` | Maximum size of each returned image, before base64 encoding |
+| `MCP_IMAGE_LOG_LEVEL` | `INFO` | Level of the logs written to stderr (`DEBUG` for details) |
+| `MCP_IMAGE_LOG_DIR` | `data/` next to `mcp_image.py` | Folder for the daily debug log file |
+
+## Testing and Debugging
+Run the test suite:
+
+```bash
+uv sync --all-extras
+uv run pytest
+```
+
+Try the tool interactively with the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+
+```bash
+npx @modelcontextprotocol/inspector uv run mcp-image
+```
+
+Or from the command line:
+
+```bash
+npx @modelcontextprotocol/inspector --cli uv run mcp-image --method tools/call --tool-name fetch_images --tool-arg 'image_sources=["/path/to/image.png"]'
+```
+
+Logs:
+- stderr shows one line per processed source and a summary per call; most clients show this in their MCP server logs.
+- A detailed debug log (formats, sizes, compression steps) is written daily to `MCP_IMAGE_LOG_DIR`.
+
 ## Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please run `uv run pytest` before submitting a Pull Request.
 
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
