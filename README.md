@@ -25,10 +25,10 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - Fetch images from `http(s)` URLs (redirects followed) and local paths, including `~/...` and `file://` URIs
 - Detects the real format from the file contents, so wrong extensions and `application/octet-stream` responses (e.g. Telegram's file API) still work
 - Returns JPEG, PNG, GIF and WebP as-is when they are small enough; converts everything else (BMP, TIFF, ...) to PNG or JPEG
-- Downscales to 1568px on the longer edge and keeps each image under ~750 KB (about 1 MB once base64-encoded, the limit Claude Desktop enforces)
-- Keeps transparency (PNG) when possible, applies EXIF rotation
+- Downscales to 1568px on the longer edge; all images in one call share a ~700 KB budget (about 930 KB once base64-encoded), under the ~1 MB tool-result limit Claude Desktop is reported to enforce
+- Keeps transparency (PNG) when possible, applies EXIF rotation, and converts palette, 1-bit and 16-bit images without losing their tones
 - Optional SVG support: small icons are rendered large enough to read, and an SVG cannot pull in other local files or URLs
-- Processes multiple images in parallel; a failed source returns a message saying why, in its position in the list
+- Processes up to 20 sources per call in parallel; a failed source returns a message saying why, in its position in the list
 
 ## Prerequisites
 - Python 3.11+
@@ -36,7 +36,7 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - For SVG support only: the native Cairo library
   - Debian/Ubuntu: `sudo apt install libcairo2`
   - macOS: `brew install cairo` (on Apple Silicon, also set `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` for the server)
-  - Windows: install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer) and make sure its `bin` folder is on `PATH`
+  - Windows: install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer). Its default folder (`C:\Program Files\GTK3-Runtime Win64\bin`) is found automatically; for another location, or another app that bundles `libcairo-2.dll`, set `CAIRO_DLL_DIRS` to that folder
 
 ## Installation
 ```bash
@@ -59,6 +59,12 @@ Without cloning, straight from GitHub:
 uvx --from git+https://github.com/IA-Programming/mcp-images mcp-image
 ```
 
+With SVG support:
+
+```bash
+uvx --from "mcp-image[svg] @ git+https://github.com/IA-Programming/mcp-images" mcp-image
+```
+
 With Docker (SVG support included):
 
 ```bash
@@ -67,6 +73,8 @@ docker run -i --rm -v "$HOME/Pictures:/images:ro" mcp-image
 ```
 
 Inside the container, local paths refer to the mounted folder, e.g. `/images/photo.jpg`.
+
+The tool can read any file the server process can read and fetch any URL it can reach, including hosts on your local network. Running it in Docker with read-only mounts limits it to the folders you choose.
 
 ## Client Configuration
 Replace `/path/to/mcp-images` with where you cloned the repository. Drop `"--extra", "svg"` if you did not install Cairo.
@@ -113,6 +121,8 @@ Parameters:
 
 Returns one entry per source, in the same order: the image, or a text message explaining why that source failed (for example `Error processing /tmp/a.png: file not found: /tmp/a.png`).
 
+Limits per call: 20 sources, 50 MB per file or download, 30 seconds per download, and 40 megapixels per decoded image (large JPEGs are decoded at a reduced scale, so camera photos are fine).
+
 ### Usage Examples
 - "Fetch these images: [list of URLs or file paths]"
 - "Look at ~/Desktop/screenshot.png and tell me what's wrong with the layout"
@@ -132,9 +142,10 @@ Optional environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_IMAGE_MAX_DIMENSION` | `1568` | Longest edge, in pixels, of returned images |
-| `MCP_IMAGE_MAX_BYTES` | `750000` | Maximum size of each returned image, before base64 encoding |
+| `MCP_IMAGE_MAX_TOTAL_BYTES` | `700000` | Size budget shared by all images in one call, before base64 encoding |
 | `MCP_IMAGE_LOG_LEVEL` | `INFO` | Level of the logs written to stderr (`DEBUG` for details) |
-| `MCP_IMAGE_LOG_DIR` | `data/` next to `mcp_image.py` | Folder for the daily debug log file |
+| `MCP_IMAGE_LOG_DIR` | unset | Folder for a detailed debug log file; no file is written when unset |
+| `CAIRO_DLL_DIRS` | unset | Windows only: folders (separated by `;`) containing `libcairo-2.dll` |
 
 ## Testing and Debugging
 Run the test suite:
@@ -156,9 +167,16 @@ Or from the command line:
 npx @modelcontextprotocol/inspector --cli uv run mcp-image --method tools/call --tool-name fetch_images --tool-arg 'image_sources=["/path/to/image.png"]'
 ```
 
+Or with the bundled stdio smoke test, which exits non-zero unless every source comes back as an image:
+
+```bash
+uv run python tests/stdio_smoke.py /path/to/image.png -- uv run mcp-image
+```
+
 Logs:
 - stderr shows one line per processed source and a summary per call; most clients show this in their MCP server logs.
-- A detailed debug log (formats, sizes, compression steps) is written daily to `MCP_IMAGE_LOG_DIR`.
+- With `MCP_IMAGE_LOG_DIR` set, a detailed debug log (formats, sizes, compression steps) is also written there, in a file named after the date the server started.
+- URLs are logged without credentials, query strings or Telegram bot tokens.
 
 ## Contributing
 Contributions are welcome! Please run `uv run pytest` before submitting a Pull Request.
