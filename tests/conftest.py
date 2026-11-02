@@ -1,0 +1,84 @@
+import base64
+import os
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+
+os.environ.setdefault("MCP_IMAGE_LOG_DIR", tempfile.mkdtemp(prefix="mcp-image-test-logs-"))
+
+import pytest
+from mcp.client import Client
+from PIL import Image
+
+import mcp_image
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def make_image(mode="RGB", size=(64, 48), color="red", noise=False):
+    if noise:
+        bands = len(Image.new(mode, (1, 1)).getbands())
+        return Image.frombytes(mode, size, os.urandom(size[0] * size[1] * bands))
+    return Image.new(mode, size, color)
+
+
+def to_bytes(img, fmt, **params):
+    buf = BytesIO()
+    img.save(buf, fmt, **params)
+    return buf.getvalue()
+
+
+def decode(block):
+    return Image.open(BytesIO(base64.b64decode(block.data)))
+
+
+async def call_fetch(sources):
+    async with Client(mcp_image.mcp) as client:
+        return await client.call_tool("fetch_images", {"image_sources": sources})
+
+
+SMALL_PNG = to_bytes(make_image(), "PNG")
+
+
+class Handler(BaseHTTPRequestHandler):
+    seen_user_agents: list[str] = []
+
+    routes = {
+        "/img.png": (200, "image/png", SMALL_PNG),
+        "/img-charset.png": (200, "image/png; charset=binary", SMALL_PNG),
+        "/octet": (200, "application/octet-stream", SMALL_PNG),
+        "/no-type": (200, None, SMALL_PNG),
+        "/html": (200, "text/html; charset=utf-8", b"<html><body>not an image</body></html>"),
+        "/missing": (404, "text/plain", b"nope"),
+    }
+
+    def do_GET(self):
+        Handler.seen_user_agents.append(self.headers.get("User-Agent", ""))
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/img.png")
+            self.end_headers()
+            return
+        status, content_type, body = self.routes.get(self.path, (404, "text/plain", b""))
+        self.send_response(status)
+        if content_type:
+            self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="session")
+def http_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
