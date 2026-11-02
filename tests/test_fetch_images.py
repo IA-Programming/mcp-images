@@ -1,4 +1,5 @@
 import base64
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,8 +25,23 @@ def assert_within_limits(block):
 async def test_tool_is_listed_with_read_only_hint():
     async with Client(mcp_image.mcp) as client:
         (tool,) = (await client.list_tools()).tools
+        version = client.server_info.version
     assert tool.name == "fetch_images"
     assert tool.annotations.read_only_hint is True
+    assert version == mcp_image.VERSION != "0+unknown"
+
+
+def test_urls_are_redacted_for_logs():
+    url = "https://user:pw@api.telegram.org/file/bot123456:AAH-secret_x/photos/a.jpg?sig=abc#frag"
+    assert mcp_image.redact(url) == "https://api.telegram.org/file/bot<redacted>/photos/a.jpg?<redacted>"
+    assert mcp_image.redact("/home/me/a.png") == "/home/me/a.png"
+
+
+async def test_log_file_does_not_contain_url_secrets(http_server):
+    await call_fetch([http_server + "/file/bot123456:AAH-secret_x/a.jpg?token=hunter2"])
+    log_text = "".join(p.read_text() for p in Path(os.environ["MCP_IMAGE_LOG_DIR"]).glob("*.log"))
+    assert "/file/bot<redacted>/a.jpg?<redacted>" in log_text
+    assert "AAH-secret_x" not in log_text and "hunter2" not in log_text
 
 
 async def test_small_png_is_passed_through_unchanged(tmp_path):
@@ -220,12 +236,12 @@ async def test_url_failures_explain_why(http_server, route, message):
     assert block.type == "text" and message in block.text
 
 
-async def test_stdio_server_starts_without_writing_to_cwd(tmp_path):
+async def test_stdio_server_starts_without_writing_to_cwd_even_with_a_bad_log_level(tmp_path):
     module = Path(mcp_image.__file__).resolve()
     work = tmp_path / "work"
     work.mkdir()
     params = StdioServerParameters(
-        command=sys.executable, args=[str(module)], cwd=work, env={"MCP_IMAGE_LOG_DIR": str(tmp_path / "logs")}
+        command=sys.executable, args=[str(module)], cwd=work, env={"MCP_IMAGE_LOG_DIR": str(tmp_path / "logs"), "MCP_IMAGE_LOG_LEVEL": "verbose"}
     )
     async with Client(params) as client:
         result = await client.call_tool("fetch_images", {"image_sources": [str(module)]})

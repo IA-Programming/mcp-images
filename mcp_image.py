@@ -8,9 +8,10 @@ import re
 import sys
 import time
 from datetime import datetime
+from importlib import metadata
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from urllib.request import url2pathname
 
 import httpx
@@ -47,7 +48,12 @@ EXIF_TRANSPOSE = {
 }
 # Replaced by the MAX_DECODE_PIXELS check, which runs after JPEG draft scaling.
 PILImage.MAX_IMAGE_PIXELS = None
-USER_AGENT = f"mcp-image/0.2 (https://github.com/IA-Programming/mcp-images) python-httpx/{httpx.__version__}"
+try:
+    VERSION = metadata.version("mcp-image")
+except metadata.PackageNotFoundError:
+    VERSION = "0+unknown"
+USER_AGENT = f"mcp-image/{VERSION} (https://github.com/IA-Programming/mcp-images) python-httpx/{httpx.__version__}"
+TELEGRAM_BOT_TOKEN = re.compile(r"/bot\d+:[\w-]+")
 SVG_TARGET_DIMENSION = 1024
 # Servers often label SVG with generic types, so only these are sniffed for an <svg> root.
 GENERIC_CONTENT_TYPES = {"", "application/octet-stream", "binary/octet-stream", "text/plain", "text/xml", "application/xml"}
@@ -64,26 +70,30 @@ def setup_logging() -> logging.Logger:
     logger.propagate = False
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+    level_name = os.environ.get("MCP_IMAGE_LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelNamesMapping().get(level_name)
     console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(os.environ.get("MCP_IMAGE_LOG_LEVEL", "INFO").upper())
+    console_handler.setLevel(level or logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+    if level is None:
+        logger.warning("Unknown MCP_IMAGE_LOG_LEVEL %r, using INFO", level_name)
 
-    # Clients often launch servers from an unwritable cwd, so never log relative to it.
-    log_dir = Path(os.environ.get("MCP_IMAGE_LOG_DIR") or Path(__file__).resolve().parent / "data")
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_dir / f"{datetime.now():%Y-%m-%d}.log", encoding="utf-8")
-    except OSError as e:
-        logger.warning("File logging disabled: %s", e)
-    else:
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+    log_dir = os.environ.get("MCP_IMAGE_LOG_DIR")
+    if log_dir:
+        try:
+            Path(log_dir).mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(Path(log_dir) / f"mcp-image-{datetime.now():%Y-%m-%d}.log", encoding="utf-8")
+        except OSError as e:
+            logger.warning("File logging disabled: %s", e)
+        else:
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
     return logger
 
 
 logger = setup_logging()
-mcp = MCPServer("image-service")
+mcp = MCPServer("image-service", version=VERSION)
 
 
 class ImageSourceError(Exception):
@@ -93,6 +103,16 @@ class ImageSourceError(Exception):
 def is_url(source: str) -> bool:
     parsed = urlparse(source)
     return bool(parsed.scheme and parsed.netloc)
+
+
+def redact(source: str) -> str:
+    """Strip credentials, query strings and Telegram bot tokens from a URL before it is logged."""
+    if not is_url(source):
+        return source
+    parts = urlsplit(source)
+    host = parts.netloc.rpartition("@")[2]
+    query = "?<redacted>" if parts.query else ""
+    return f"{parts.scheme}://{host}{TELEGRAM_BOT_TOKEN.sub('/bot<redacted>', parts.path)}{query}"
 
 
 def resolve_local_path(source: str) -> Path:
@@ -124,7 +144,7 @@ async def read_url(url: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
                 raise ImageSourceError(f"download exceeds the {MAX_SOURCE_BYTES} byte limit")
             chunks.append(chunk)
     data = b"".join(chunks)
-    logger.debug("%s: HTTP %d, Content-Type %r, %d bytes", url, response.status_code, content_type, len(data))
+    logger.debug("%s: HTTP %d, Content-Type %r, %d bytes", redact(url), response.status_code, content_type, len(data))
     return data, content_type
 
 
@@ -278,8 +298,8 @@ async def process_source(source: str, client: httpx.AsyncClient, budget: int, li
         else:
             data, content_type = await asyncio.to_thread(read_local, source), ""
         if is_svg(data, content_type):
-            data = await asyncio.to_thread(render_svg, data, source)
-        return await asyncio.to_thread(prepare_image, data, source, budget, content_type)
+            data = await asyncio.to_thread(render_svg, data, redact(source))
+        return await asyncio.to_thread(prepare_image, data, redact(source), budget, content_type)
 
 
 def describe_error(source: str, error: BaseException) -> str:
@@ -338,7 +358,7 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
         if isinstance(result, Image):
             output.append(result)
         else:
-            output.append(f"Error processing {source}: {describe_error(source, result)}")
+            output.append(f"Error processing {source}: {describe_error(redact(source), result)}")
 
     ok = sum(isinstance(r, Image) for r in output)
     logger.info("Processed %d sources in %.2fs: %d ok, %d failed", len(output), time.perf_counter() - start, ok, len(output) - ok)
