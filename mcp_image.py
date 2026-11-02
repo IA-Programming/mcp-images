@@ -10,6 +10,7 @@ from datetime import datetime
 from PIL import Image as PILImage
 from urllib.parse import urlparse
 from mcp.server.mcpserver import MCPServer, Image, Context
+from mcp.types import ToolAnnotations
 from typing import List, Dict, Any, Union, Optional
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
@@ -389,7 +390,11 @@ async def process_images_async(image_sources: List[str], ctx: Context) -> List[D
     
     return ordered_results
 
-@mcp.tool()
+@mcp.tool(
+    title="Fetch images",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    structured_output=False,
+)
 async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | None]:
     """
     Fetch and process images from URLs or local file paths, returning them in a format suitable for LLMs.
@@ -447,5 +452,8 @@ async def fetch_images(image_sources: List[str], ctx: Context) -> List[Image | N
         ctx.error(f"Failed to process images: {str(e)}")
         return [None] * len(image_sources)
 
-if __name__ == "__main__":
+def main():
     mcp.run(transport='stdio')
+
+if __name__ == "__main__":
+    main()
