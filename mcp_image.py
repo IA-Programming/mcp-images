@@ -159,7 +159,8 @@ def prepare_image(data: bytes, source: str, content_type: str = "") -> Image:
         fmt, (width, height) = img.format, img.size
         logger.debug("%s: %s %dx%d mode=%s, %d bytes", source, fmt, width, height, img.mode, len(data))
 
-        if fmt in PASSTHROUGH_FORMATS and len(data) <= MAX_BYTES and max(width, height) <= MAX_DIMENSION:
+        rotated = img.getexif().get(0x0112, 1) != 1
+        if fmt in PASSTHROUGH_FORMATS and len(data) <= MAX_BYTES and max(width, height) <= MAX_DIMENSION and not rotated:
             logger.info("%s: passed through as %s %dx%d (%d bytes)", source, fmt, width, height, len(data))
             return Image(data=data, format=fmt.lower())
 

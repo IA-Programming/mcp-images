@@ -76,8 +76,9 @@ async def test_formats_llms_cannot_read_are_converted(tmp_path, fmt, ext):
     assert decode(block).getpixel((0, 0)) == (255, 0, 0)
 
 
-async def test_exif_orientation_is_applied_when_reencoding(tmp_path):
-    img = make_image(size=(2000, 1000))
+@pytest.mark.parametrize("size", [(200, 100), (2000, 1000)])
+async def test_exif_orientation_is_applied(tmp_path, size):
+    img = make_image(size=size)
     exif = img.getexif()
     exif[0x0112] = 6
     path = tmp_path / "rotated.jpg"
@@ -96,6 +97,7 @@ async def test_extension_is_ignored_in_favor_of_content(tmp_path):
 
 async def test_file_uri_and_home_expansion(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / "a.png").write_bytes(SMALL_PNG)
     result = await call_fetch([(tmp_path / "a.png").as_uri(), "~/a.png"])
     assert [b.type for b in result.content] == ["image", "image"]
@@ -165,7 +167,10 @@ async def test_stdio_server_starts_without_writing_to_cwd(tmp_path):
 
 @pytest.fixture
 def svg_support():
-    pytest.importorskip("cairosvg", reason="install the svg extra to run SVG tests")
+    try:
+        import cairosvg  # noqa: F401
+    except (ImportError, OSError) as e:
+        pytest.skip(f"SVG support unavailable: {e}")
 
 
 @pytest.mark.usefixtures("svg_support")
