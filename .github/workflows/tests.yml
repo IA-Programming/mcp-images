@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: windows-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Cairo for SVG tests
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcairo2
+      - run: uv sync --locked --all-extras
+      - run: uv run pytest -v
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t mcp-image .
+      - name: Smoke test the image over stdio (including SVG via Cairo)
+        run: |
+          echo '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="10" fill="red"/></svg>' > icon.svg
+          { printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+              '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+              '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+              '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_images","arguments":{"image_sources":["/icon.svg"]}}}'
+            sleep 10; } \
+          | timeout 60 docker run -i --rm -v "$PWD/icon.svg:/icon.svg:ro" mcp-image > out.jsonl
+          cat out.jsonl | cut -c1-300
+          grep -q '"fetch_images"' out.jsonl
+          grep -q '"mimeType":"image/png"' out.jsonl

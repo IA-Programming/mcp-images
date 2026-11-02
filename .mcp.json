@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "image": {
+      "command": "uv",
+      "args": ["run", "--extra", "svg", "mcp-image"]
+    }
+  }
+}
