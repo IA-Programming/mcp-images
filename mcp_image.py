@@ -16,18 +16,35 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from PIL import Image as PILImage
-from PIL import ImageOps, UnidentifiedImageError
+from PIL import UnidentifiedImageError
 
 # Claude downscales anything with a longer edge above 1568px, so larger images only cost bytes.
 MAX_DIMENSION = int(os.environ.get("MCP_IMAGE_MAX_DIMENSION", 1568))
-# Claude Desktop rejects tool results over ~1 MB and base64 adds a third, so cap raw bytes at 750 KB.
-MAX_BYTES = int(os.environ.get("MCP_IMAGE_MAX_BYTES", 750_000))
+# Claude Desktop reportedly rejects tool results over ~1 MB and base64 adds a third, so all images
+# in one call share a 700 KB raw budget.
+MAX_TOTAL_BYTES = int(os.environ.get("MCP_IMAGE_MAX_TOTAL_BYTES", 700_000))
+MAX_SOURCES = 20
+MAX_CONCURRENCY = 4
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
+# Bounds decoder memory; checked after JPEG draft scaling, so large JPEG photos still work.
+MAX_DECODE_PIXELS = 40_000_000
 MIN_DIMENSION = 200
 FETCH_TIMEOUT = 30.0
 JPEG_QUALITIES = (85, 75, 65, 50, 35)
 PASSTHROUGH_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 LOSSLESS_FORMATS = {"PNG", "GIF", "BMP", "TIFF", "ICO", "PPM", "TGA"}
+ORIENTATION_TAG = 0x0112
+EXIF_TRANSPOSE = {
+    2: PILImage.Transpose.FLIP_LEFT_RIGHT,
+    3: PILImage.Transpose.ROTATE_180,
+    4: PILImage.Transpose.FLIP_TOP_BOTTOM,
+    5: PILImage.Transpose.TRANSPOSE,
+    6: PILImage.Transpose.ROTATE_270,
+    7: PILImage.Transpose.TRANSVERSE,
+    8: PILImage.Transpose.ROTATE_90,
+}
+# Replaced by the MAX_DECODE_PIXELS check, which runs after JPEG draft scaling.
+PILImage.MAX_IMAGE_PIXELS = None
 USER_AGENT = f"mcp-image/0.2 (https://github.com/IA-Programming/mcp-images) python-httpx/{httpx.__version__}"
 SVG_TARGET_DIMENSION = 1024
 SVG_PROBE_SCALE = 1 / 8
@@ -91,7 +108,7 @@ def read_local(source: str) -> bytes:
 async def read_url(url: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
     if urlparse(url).scheme not in ("http", "https"):
         raise ImageSourceError("only http(s) URLs and local file paths are supported")
-    async with client.stream("GET", url) as response:
+    async with asyncio.timeout(FETCH_TIMEOUT), client.stream("GET", url) as response:
         response.raise_for_status()
         content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
         chunks, total = [], 0
@@ -135,7 +152,29 @@ def render_svg(data: bytes, source: str) -> bytes:
 
 
 def has_alpha(img: PILImage.Image) -> bool:
-    return img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
+    return img.mode in ("RGBA", "RGBa", "LA", "La", "PA") or (img.mode == "P" and "transparency" in img.info)
+
+
+def decode(img: PILImage.Image) -> None:
+    try:
+        img.load()
+    except (OSError, SyntaxError, ValueError) as e:
+        raise ImageSourceError(f"image data is truncated or corrupt ({e})") from None
+
+
+def to_display_mode(img: PILImage.Image) -> PILImage.Image:
+    """Convert to L, RGB or RGBA; Pillow resizes palette and 1-bit images with nearest neighbour."""
+    if img.mode in ("L", "RGB", "RGBA"):
+        return img
+    if img.mode == "1":
+        return img.convert("L")
+    if img.mode.startswith("I") or img.mode == "F":
+        # 16/32-bit and float pixels clip to white in an 8-bit conversion, so stretch their range first.
+        img = img.convert("F")
+        lo, hi = img.getextrema()
+        scale = 255 / (hi - lo) if hi > lo else 1
+        return img.point(lambda v: v * scale - lo * scale).convert("L")
+    return img.convert("RGBA" if has_alpha(img) else "RGB")
 
 
 def encode(img: PILImage.Image, fmt: str, quality: int | None = None) -> bytes:
@@ -147,8 +186,8 @@ def encode(img: PILImage.Image, fmt: str, quality: int | None = None) -> bytes:
     return buf.getvalue()
 
 
-def prepare_image(data: bytes, source: str, content_type: str = "") -> Image:
-    """Return the image as-is when a client can use it directly, otherwise re-encode it within limits."""
+def prepare_image(data: bytes, source: str, budget: int, content_type: str = "") -> Image:
+    """Return the image as-is when a client can use it directly, otherwise re-encode it within budget bytes."""
     try:
         img = PILImage.open(BytesIO(data))
     except UnidentifiedImageError:
@@ -159,34 +198,38 @@ def prepare_image(data: bytes, source: str, content_type: str = "") -> Image:
         fmt, (width, height) = img.format, img.size
         logger.debug("%s: %s %dx%d mode=%s, %d bytes", source, fmt, width, height, img.mode, len(data))
 
-        rotated = img.getexif().get(0x0112, 1) != 1
-        if fmt in PASSTHROUGH_FORMATS and len(data) <= MAX_BYTES and max(width, height) <= MAX_DIMENSION and not rotated:
+        img.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
+        if img.width * img.height > MAX_DECODE_PIXELS:
+            raise ImageSourceError(
+                f"image is {width}x{height}; at most {MAX_DECODE_PIXELS / 1_000_000:g} megapixels can be decoded"
+            )
+        decode(img)
+        orientation = img.getexif().get(ORIENTATION_TAG, 1)
+
+        if fmt in PASSTHROUGH_FORMATS and len(data) <= budget and max(width, height) <= MAX_DIMENSION and orientation == 1:
             logger.info("%s: passed through as %s %dx%d (%d bytes)", source, fmt, width, height, len(data))
             return Image(data=data, format=fmt.lower())
 
-        img.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
-        img = ImageOps.exif_transpose(img)
+        img = to_display_mode(img)
         img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), PILImage.Resampling.LANCZOS)
+        if orientation in EXIF_TRANSPOSE:
+            img = img.transpose(EXIF_TRANSPOSE[orientation])
 
-        if has_alpha(img) or fmt in LOSSLESS_FORMATS:
-            img = img.convert("RGBA" if has_alpha(img) else "RGB")
+        if img.mode == "RGBA" or fmt in LOSSLESS_FORMATS:
             png = encode(img, "PNG")
-            if len(png) <= MAX_BYTES:
+            if len(png) <= budget:
                 logger.info("%s: %s %dx%d -> PNG %dx%d (%d bytes)", source, fmt, width, height, *img.size, len(png))
                 return Image(data=png, format="png")
 
-        if has_alpha(img):
-            img = img.convert("RGBA")
+        if img.mode == "RGBA":
             background = PILImage.new("RGB", img.size, "white")
             background.paste(img, mask=img.getchannel("A"))
             img = background
-        else:
-            img = img.convert("RGB")
 
         while True:
             for quality in JPEG_QUALITIES:
                 jpeg = encode(img, "JPEG", quality)
-                if len(jpeg) <= MAX_BYTES:
+                if len(jpeg) <= budget:
                     logger.info(
                         "%s: %s %dx%d -> JPEG %dx%d q=%d (%d bytes)",
                         source, fmt, width, height, *img.size, quality, len(jpeg),
@@ -194,19 +237,20 @@ def prepare_image(data: bytes, source: str, content_type: str = "") -> Image:
                     return Image(data=jpeg, format="jpeg")
             new_size = (int(img.width * 0.75), int(img.height * 0.75))
             if min(new_size) < MIN_DIMENSION:
-                raise ImageSourceError(f"could not compress below {MAX_BYTES} bytes without dropping under {MIN_DIMENSION}px")
+                raise ImageSourceError(f"could not compress below {budget} bytes without dropping under {MIN_DIMENSION}px")
             logger.debug("%s: still %d bytes at q=%d, scaling to %dx%d", source, len(jpeg), quality, *new_size)
             img = img.resize(new_size, PILImage.Resampling.LANCZOS)
 
 
-async def process_source(source: str, client: httpx.AsyncClient) -> Image:
-    if is_url(source):
-        data, content_type = await read_url(source, client)
-    else:
-        data, content_type = await asyncio.to_thread(read_local, source), ""
-    if is_svg(data, content_type):
-        data = await asyncio.to_thread(render_svg, data, source)
-    return await asyncio.to_thread(prepare_image, data, source, content_type)
+async def process_source(source: str, client: httpx.AsyncClient, budget: int, limit: asyncio.Semaphore) -> Image:
+    async with limit:
+        if is_url(source):
+            data, content_type = await read_url(source, client)
+        else:
+            data, content_type = await asyncio.to_thread(read_local, source), ""
+        if is_svg(data, content_type):
+            data = await asyncio.to_thread(render_svg, data, source)
+        return await asyncio.to_thread(prepare_image, data, source, budget, content_type)
 
 
 def describe_error(source: str, error: BaseException) -> str:
@@ -216,6 +260,8 @@ def describe_error(source: str, error: BaseException) -> str:
         reason = f"HTTP {error.response.status_code} {error.response.reason_phrase}"
     elif isinstance(error, httpx.HTTPError):
         reason = f"request failed ({type(error).__name__}: {error})"
+    elif isinstance(error, TimeoutError):
+        reason = f"download took longer than {FETCH_TIMEOUT:g}s"
     else:
         logger.error("%s: unexpected error", source, exc_info=error)
         return f"{type(error).__name__}: {error}"
@@ -238,19 +284,24 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
 
     Common raster formats are supported, plus SVG when the optional `svg` extra is installed.
 
-    For a single image, provide a one-element list; multiple sources are processed in parallel.
-    Images are downscaled and recompressed when needed so each stays small enough for the client.
+    For a single image, provide a one-element list; at most 20 sources per call, processed in parallel.
+    Images are downscaled and recompressed when needed. All images in one call share a size budget,
+    so request fewer images per call when fine detail matters.
     Returns one entry per source, in input order: the image, or a text message explaining why that
     source failed.
     """
     if not image_sources:
         raise ToolError("image_sources is empty; provide at least one URL or file path")
+    if len(image_sources) > MAX_SOURCES:
+        raise ToolError(f"got {len(image_sources)} sources; at most {MAX_SOURCES} per call, so split them across calls")
 
     start = time.perf_counter()
+    budget = MAX_TOTAL_BYTES // len(image_sources)
+    limit = asyncio.Semaphore(MAX_CONCURRENCY)
     headers = {"User-Agent": USER_AGENT}
     async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
         results = await asyncio.gather(
-            *(process_source(source, client) for source in image_sources), return_exceptions=True
+            *(process_source(source, client, budget, limit) for source in image_sources), return_exceptions=True
         )
 
     output: list[Image | str] = []

@@ -8,7 +8,7 @@ from mcp.client import Client
 from PIL import Image
 
 import mcp_image
-from conftest import ICON_SVG, SMALL_PNG, Handler, call_fetch, decode, make_image, to_bytes
+from conftest import ICON_SVG, SMALL_PNG, Handler, call_fetch, decode, make_image, png_with_declared_size, to_bytes
 
 pytestmark = pytest.mark.anyio
 
@@ -16,7 +16,7 @@ pytestmark = pytest.mark.anyio
 def assert_within_limits(block):
     assert block.type == "image"
     assert block.mime_type in {"image/jpeg", "image/png", "image/gif", "image/webp"}
-    assert len(base64.b64decode(block.data)) <= mcp_image.MAX_BYTES
+    assert len(base64.b64decode(block.data)) <= mcp_image.MAX_TOTAL_BYTES
     assert max(decode(block).size) <= mcp_image.MAX_DIMENSION
 
 
@@ -39,7 +39,7 @@ async def test_small_png_is_passed_through_unchanged(tmp_path):
 async def test_large_photo_is_downscaled_and_compressed(tmp_path):
     path = tmp_path / "big.jpg"
     path.write_bytes(to_bytes(make_image(size=(4000, 3000), noise=True), "JPEG", quality=95))
-    assert path.stat().st_size > mcp_image.MAX_BYTES
+    assert path.stat().st_size > mcp_image.MAX_TOTAL_BYTES
     (block,) = (await call_fetch([str(path)])).content
     assert_within_limits(block)
     assert block.mime_type == "image/jpeg"
@@ -124,11 +124,79 @@ async def test_empty_source_list_is_a_tool_error():
 
 
 async def test_reports_when_image_cannot_be_compressed(tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_image, "MAX_BYTES", 2_000)
+    monkeypatch.setattr(mcp_image, "MAX_TOTAL_BYTES", 2_000)
     path = tmp_path / "noise.jpg"
     path.write_bytes(to_bytes(make_image(size=(1200, 1200), noise=True), "JPEG"))
     (block,) = (await call_fetch([str(path)])).content
     assert block.type == "text" and "could not compress" in block.text
+
+
+async def test_images_in_one_call_share_the_size_budget(tmp_path):
+    path = tmp_path / "big.jpg"
+    path.write_bytes(to_bytes(make_image(size=(3000, 2000), noise=True), "JPEG", quality=95))
+    result = await call_fetch([str(path)] * 3)
+    sizes = [len(base64.b64decode(b.data)) for b in result.content]
+    assert [b.type for b in result.content] == ["image"] * 3
+    assert sum(sizes) <= mcp_image.MAX_TOTAL_BYTES
+
+
+async def test_too_many_sources_is_a_tool_error():
+    result = await call_fetch(["a.png"] * (mcp_image.MAX_SOURCES + 1))
+    assert result.is_error
+    assert f"at most {mcp_image.MAX_SOURCES}" in result.content[0].text
+
+
+async def test_images_too_large_to_decode_are_rejected_before_decoding(tmp_path):
+    path = tmp_path / "bomb.png"
+    path.write_bytes(png_with_declared_size(30_000, 30_000))
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "megapixels" in block.text
+
+
+async def test_large_jpegs_are_decoded_at_reduced_scale(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_image, "MAX_DIMENSION", 500)
+    monkeypatch.setattr(mcp_image, "MAX_DECODE_PIXELS", 1_000_000)
+    jpeg, png = tmp_path / "big.jpg", tmp_path / "big.png"
+    jpeg.write_bytes(to_bytes(make_image(size=(4000, 4000)), "JPEG"))
+    png.write_bytes(to_bytes(make_image(size=(2000, 2000)), "PNG"))
+    result = await call_fetch([str(jpeg), str(png)])
+    assert [b.type for b in result.content] == ["image", "text"]
+    assert max(decode(result.content[0]).size) <= 500
+
+
+@pytest.mark.parametrize("mode", ["1", "P"])
+async def test_palette_and_1bit_images_are_smoothed_when_downscaled(tmp_path, mode):
+    row_bytes = 3000 // 8
+    stripes = Image.frombytes("1", (3000, 3000), (b"\x00" * row_bytes + b"\xff" * row_bytes) * 1500)
+    path = tmp_path / "stripes.png"
+    path.write_bytes(to_bytes(stripes if mode == "1" else stripes.convert("P"), "PNG"))
+    (block,) = (await call_fetch([str(path)])).content
+    gray = decode(block).convert("L")
+    assert len(gray.getcolors(256)) > 2
+    assert 100 < gray.getpixel((gray.width // 2, gray.height // 2)) < 155
+
+
+async def test_16bit_images_keep_their_tones(tmp_path):
+    gradient = Image.linear_gradient("L").resize((2000, 2000)).convert("I").point(lambda v: v * 256).convert("I;16")
+    path = tmp_path / "depth.png"
+    path.write_bytes(to_bytes(gradient, "PNG"))
+    (block,) = (await call_fetch([str(path)])).content
+    gray = decode(block).convert("L")
+    assert 100 < gray.getpixel((gray.width // 2, gray.height // 2)) < 155
+    assert len(gray.getcolors(256)) > 200
+
+
+async def test_truncated_images_are_reported(tmp_path):
+    path = tmp_path / "cut.jpg"
+    path.write_bytes(to_bytes(make_image(size=(300, 200), noise=True), "JPEG")[:-2000])
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "truncated or corrupt" in block.text
+
+
+async def test_slow_downloads_have_an_overall_deadline(http_server, monkeypatch):
+    monkeypatch.setattr(mcp_image, "FETCH_TIMEOUT", 1)
+    (block,) = (await call_fetch([http_server + "/slow"])).content
+    assert block.type == "text" and "took longer than 1s" in block.text
 
 
 @pytest.mark.parametrize("route", ["/img.png", "/img-charset.png", "/redirect", "/octet", "/no-type"])

@@ -1,7 +1,10 @@
 import base64
 import os
+import struct
 import tempfile
 import threading
+import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 
@@ -42,6 +45,16 @@ async def call_fetch(sources):
 
 
 SMALL_PNG = to_bytes(make_image(), "PNG")
+
+
+def png_with_declared_size(width, height):
+    """A tiny PNG whose header claims the given size, without the pixel data to back it."""
+    data = bytearray(SMALL_PNG)
+    struct.pack_into(">II", data, 16, width, height)
+    struct.pack_into(">I", data, 29, zlib.crc32(bytes(data[12:29])))
+    return bytes(data)
+
+
 ICON_SVG = (
     b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12">'
     b'<rect width="24" height="12" fill="#ff0000"/></svg>'
@@ -67,6 +80,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "/img.png")
             self.end_headers()
+            return
+        if self.path == "/slow":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            try:
+                for byte in SMALL_PNG[:40]:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.25)
+            except OSError:
+                pass
             return
         status, content_type, body = self.routes.get(self.path, (404, "text/plain", b""))
         self.send_response(status)
