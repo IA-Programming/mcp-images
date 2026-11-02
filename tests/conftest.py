@@ -42,6 +42,10 @@ async def call_fetch(sources):
 
 
 SMALL_PNG = to_bytes(make_image(), "PNG")
+ICON_SVG = (
+    b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12">'
+    b'<rect width="24" height="12" fill="#ff0000"/></svg>'
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,6 +58,7 @@ class Handler(BaseHTTPRequestHandler):
         "/no-type": (200, None, SMALL_PNG),
         "/html": (200, "text/html; charset=utf-8", b"<html><body>not an image</body></html>"),
         "/missing": (404, "text/plain", b"nope"),
+        "/icon": (200, "image/svg+xml", ICON_SVG),
     }
 
     def do_GET(self):

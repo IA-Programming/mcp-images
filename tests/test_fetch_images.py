@@ -8,7 +8,7 @@ from mcp.client import Client
 from PIL import Image
 
 import mcp_image
-from conftest import SMALL_PNG, Handler, call_fetch, decode, make_image, to_bytes
+from conftest import ICON_SVG, SMALL_PNG, Handler, call_fetch, decode, make_image, to_bytes
 
 pytestmark = pytest.mark.anyio
 
@@ -161,3 +161,54 @@ async def test_stdio_server_starts_without_writing_to_cwd(tmp_path):
     assert result.content[0].type == "text"
     assert list(work.iterdir()) == []
     assert any((tmp_path / "logs").glob("*.log"))
+
+
+@pytest.fixture
+def svg_support():
+    pytest.importorskip("cairosvg", reason="install the svg extra to run SVG tests")
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_small_svg_is_rendered_large_enough_to_read(tmp_path):
+    path = tmp_path / "icon.svg"
+    path.write_bytes(ICON_SVG)
+    (block,) = (await call_fetch([str(path)])).content
+    img = decode(block)
+    assert block.mime_type == "image/png"
+    assert img.size == (mcp_image.SVG_TARGET_DIMENSION, mcp_image.SVG_TARGET_DIMENSION // 2)
+    assert img.convert("RGB").getpixel((10, 10)) == (255, 0, 0)
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_svg_from_url(http_server):
+    (block,) = (await call_fetch([http_server + "/icon"])).content
+    assert block.type == "image" and block.mime_type == "image/png"
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_huge_svg_is_capped(tmp_path):
+    path = tmp_path / "poster.svg"
+    path.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg" width="20000" height="10000"><rect width="20000" height="10000" fill="blue"/></svg>')
+    (block,) = (await call_fetch([str(path)])).content
+    assert_within_limits(block)
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_svg_cannot_read_other_local_files(tmp_path):
+    (tmp_path / "secret.png").write_bytes(SMALL_PNG)
+    path = tmp_path / "sneaky.svg"
+    path.write_bytes(
+        b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="64" height="48">'
+        b'<rect width="64" height="48" fill="white"/>'
+        b'<image xlink:href="' + (tmp_path / "secret.png").as_uri().encode() + b'" width="64" height="48"/></svg>'
+    )
+    (block,) = (await call_fetch([str(path)])).content
+    assert decode(block).convert("RGB").getpixel((30, 20)) == (255, 255, 255)
+
+
+async def test_svg_without_extra_explains_how_to_install(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "cairosvg", None)
+    path = tmp_path / "icon.svg"
+    path.write_bytes(ICON_SVG)
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "mcp-image[svg]" in block.text

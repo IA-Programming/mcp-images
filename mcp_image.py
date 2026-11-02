@@ -29,6 +29,8 @@ JPEG_QUALITIES = (85, 75, 65, 50, 35)
 PASSTHROUGH_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 LOSSLESS_FORMATS = {"PNG", "GIF", "BMP", "TIFF", "ICO", "PPM", "TGA"}
 USER_AGENT = "mcp-image/0.2 (+https://github.com/IA-Programming/mcp-images)"
+SVG_TARGET_DIMENSION = 1024
+SVG_PROBE_SCALE = 1 / 8
 
 
 def setup_logging() -> logging.Logger:
@@ -101,6 +103,35 @@ async def read_url(url: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
     return data, content_type
 
 
+def is_svg(data: bytes, content_type: str) -> bool:
+    if content_type == "image/svg+xml":
+        return True
+    head = data[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return b"<svg" in head and head.startswith((b"<svg", b"<?xml", b"<!doctype", b"<!--"))
+
+
+def render_svg(data: bytes, source: str) -> bytes:
+    """Rasterize an SVG to PNG with its longer edge near SVG_TARGET_DIMENSION."""
+    try:
+        import cairosvg
+    except (ImportError, OSError) as e:
+        raise ImageSourceError(
+            "SVG support is not installed: install the `mcp-image[svg]` extra and the Cairo library"
+        ) from e
+    try:
+        # unsafe=False (the default) stops the SVG from pulling in local files or URLs.
+        # A tiny probe render reveals the natural size without allocating a huge surface.
+        probe = cairosvg.svg2png(bytestring=data, scale=SVG_PROBE_SCALE)
+        with PILImage.open(BytesIO(probe)) as img:
+            natural = max(max(img.size) / SVG_PROBE_SCALE, 1)
+        scale = min(max(natural, SVG_TARGET_DIMENSION), MAX_DIMENSION) / natural
+        png = cairosvg.svg2png(bytestring=data, scale=scale)
+    except Exception as e:
+        raise ImageSourceError(f"could not render SVG ({type(e).__name__}: {e})") from e
+    logger.debug("%s: rendered SVG at scale %.2f (%d bytes)", source, scale, len(png))
+    return png
+
+
 def has_alpha(img: PILImage.Image) -> bool:
     return img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
 
@@ -170,6 +201,8 @@ async def process_source(source: str, client: httpx.AsyncClient) -> Image:
         data, content_type = await read_url(source, client)
     else:
         data, content_type = await asyncio.to_thread(read_local, source), ""
+    if is_svg(data, content_type):
+        data = await asyncio.to_thread(render_svg, data, source)
     return await asyncio.to_thread(prepare_image, data, source, content_type)
 
 
@@ -199,6 +232,8 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
     Each source can be:
     1. An http:// or https:// URL to a web-hosted image
     2. A local file path (e.g. "C:/images/photo1.jpg", "~/Pictures/a.png") or file:// URI
+
+    Common raster formats are supported, plus SVG when the optional `svg` extra is installed.
 
     For a single image, provide a one-element list; multiple sources are processed in parallel.
     Images are downscaled and recompressed when needed so each stays small enough for the client.
