@@ -9,7 +9,7 @@ from io import BytesIO
 from datetime import datetime
 from PIL import Image as PILImage
 from urllib.parse import urlparse
-from mcp.server.fastmcp import FastMCP, Image, Context
+from mcp.server.mcpserver import MCPServer, Image, Context
 from typing import List, Dict, Any, Union, Optional
 
 MAX_IMAGE_SIZE = 1024  # Maximum dimension size in pixels
@@ -45,7 +45,7 @@ logger.addHandler(console_handler)
 logger.propagate = False
 
 # Create a FastMCP server instance
-mcp = FastMCP("image-service")
+mcp = MCPServer("image-service")
 
 async def process_image_data(data: bytes, content_type: str, image_source: str, ctx: Context) -> Image | None:
     """Process image data and return an MCP Image object."""
