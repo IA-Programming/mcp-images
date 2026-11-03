@@ -254,6 +254,12 @@ def test_baseline_jpegs_are_single_scan(mode):
     assert not mcp_image.jpeg_is_single_scan(to_bytes(make_image(mode, color=None), "JPEG", progressive=True))
 
 
+def test_jpeg_scan_check_handles_every_truncation():
+    data = to_bytes(make_image(), "JPEG")
+    assert [mcp_image.jpeg_is_single_scan(data[:n]) for n in range(len(data))].count(True) > 0
+    assert not mcp_image.jpeg_is_single_scan(data[: data.index(b"\xff\xda") + 4])
+
+
 def test_icos_count_toward_the_budget_without_being_decoded(monkeypatch):
     def fail(*args, **kwargs):
         raise AssertionError("ICO was opened")

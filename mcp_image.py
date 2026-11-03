@@ -280,7 +280,7 @@ def jpeg_is_single_scan(data: bytes) -> bool:
         elif 0xC2 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
             return False
         elif marker == 0xDA:
-            return components is not None and data[pos + 4] == components
+            return components is not None and pos + 4 < len(data) and data[pos + 4] == components
         pos += 2 + int.from_bytes(data[pos + 2 : pos + 4], "big")
     return False
 
