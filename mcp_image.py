@@ -10,6 +10,7 @@ import sys
 import time
 import warnings
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from importlib import metadata
 from importlib.util import find_spec
@@ -32,7 +33,9 @@ MAX_DIMENSION = int(os.environ.get("MCP_IMAGE_MAX_DIMENSION", 1568))
 # in one call share a 700 KB raw budget.
 MAX_TOTAL_BYTES = int(os.environ.get("MCP_IMAGE_MAX_TOTAL_BYTES", 700_000))
 MAX_SOURCES = 20
+# Decoding and SVG rendering share one pool across calls, which bounds their memory use.
 MAX_CONCURRENCY = 4
+PROCESSING_POOL = ThreadPoolExecutor(max_workers=MAX_CONCURRENCY, thread_name_prefix="mcp-image")
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
 # Bounds decoder memory; checked after JPEG draft scaling, so large JPEG photos still work.
 MAX_DECODE_PIXELS = 40_000_000
@@ -317,15 +320,17 @@ def prepare_image(data: bytes, source: str, budget: int, content_type: str = "")
             img = img.resize(new_size, PILImage.Resampling.LANCZOS)
 
 
-async def process_source(source: str, client: httpx.AsyncClient, budget: int, limit: asyncio.Semaphore) -> Image:
-    async with limit:
-        if is_url(source):
-            data, content_type = await read_url(source, client)
-        else:
-            data, content_type = await asyncio.to_thread(read_local, source), ""
-        if is_svg(data, content_type):
-            data = await asyncio.to_thread(render_svg, data, redact(source))
-        return await asyncio.to_thread(prepare_image, data, redact(source), budget, content_type)
+async def load_source(source: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
+    if is_url(source):
+        return await read_url(source, client)
+    return await asyncio.to_thread(read_local, source), ""
+
+
+async def process_source(source: str, data: bytes, content_type: str, budget: int) -> Image:
+    loop = asyncio.get_running_loop()
+    if is_svg(data, content_type):
+        data = await loop.run_in_executor(PROCESSING_POOL, render_svg, data, redact(source))
+    return await loop.run_in_executor(PROCESSING_POOL, prepare_image, data, redact(source), budget, content_type)
 
 
 def describe_error(source: str, error: BaseException) -> str:
@@ -371,13 +376,19 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
         raise ToolError(f"got {len(image_sources)} sources; at most {MAX_SOURCES} per call, so split them across calls")
 
     start = time.perf_counter()
-    budget = MAX_TOTAL_BYTES // len(image_sources)
-    limit = asyncio.Semaphore(MAX_CONCURRENCY)
     headers = {"User-Agent": USER_AGENT, "Accept": ACCEPT}
     async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
-        results = await asyncio.gather(
-            *(process_source(source, client, budget, limit) for source in image_sources), return_exceptions=True
-        )
+        results = await asyncio.gather(*(load_source(source, client) for source in image_sources), return_exceptions=True)
+
+    # Sources that failed to load leave their share of the size budget to the others.
+    loaded = {i: item for i, item in enumerate(results) if not isinstance(item, BaseException)}
+    budget = MAX_TOTAL_BYTES // max(1, len(loaded))
+    processed = await asyncio.gather(
+        *(process_source(image_sources[i], data, content_type, budget) for i, (data, content_type) in loaded.items()),
+        return_exceptions=True,
+    )
+    for i, result in zip(loaded, processed):
+        results[i] = result
 
     output: list[Image | str] = []
     for source, result in zip(image_sources, results):

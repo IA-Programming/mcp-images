@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -165,6 +167,36 @@ async def test_images_in_one_call_share_the_size_budget(tmp_path):
     sizes = [len(base64.b64decode(b.data)) for b in result.content]
     assert [b.type for b in result.content] == ["image"] * 3
     assert sum(sizes) <= mcp_image.MAX_TOTAL_BYTES
+
+
+async def test_failed_sources_leave_their_budget_to_the_others(tmp_path):
+    path = tmp_path / "big.jpg"
+    path.write_bytes(to_bytes(make_image(size=(3000, 2000), noise=True), "JPEG", quality=95))
+    photo, missing = (await call_fetch([str(path), str(tmp_path / "missing.png")])).content
+    assert missing.type == "text"
+    assert mcp_image.MAX_TOTAL_BYTES // 2 < len(base64.b64decode(photo.data)) <= mcp_image.MAX_TOTAL_BYTES
+
+
+async def test_processing_is_limited_across_parallel_calls(tmp_path, monkeypatch):
+    lock, running, peak = threading.Lock(), [0], [0]
+    original = mcp_image.prepare_image
+
+    def counting_prepare_image(*args):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.05)
+        try:
+            return original(*args)
+        finally:
+            with lock:
+                running[0] -= 1
+
+    monkeypatch.setattr(mcp_image, "prepare_image", counting_prepare_image)
+    (tmp_path / "a.png").write_bytes(SMALL_PNG)
+    sources = [str(tmp_path / "a.png")] * 6
+    await asyncio.gather(call_fetch(sources), call_fetch(sources))
+    assert peak[0] == mcp_image.MAX_CONCURRENCY
 
 
 async def test_too_many_sources_is_a_tool_error():
