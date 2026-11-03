@@ -15,7 +15,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-dev --extra svg --no-install-project
-COPY mcp_image.py ./
+COPY mcp_image.py mcp_image_svg.py ./
 RUN uv sync --locked --no-dev --extra svg
 
 USER nobody

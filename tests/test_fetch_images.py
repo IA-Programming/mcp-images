@@ -318,17 +318,70 @@ async def test_svg_from_url(http_server):
     assert block.type == "image" and block.mime_type == "image/png"
 
 
+def svg_document(width, height, body='<rect width="100%" height="100%" fill="blue"/>', defs=""):
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'width="{width}" height="{height}"><defs>{defs}</defs>{body}</svg>'
+    ).encode()
+
+
+def embedded_image(data, mime="image/png"):
+    return f'<image xlink:href="data:{mime};base64,{base64.b64encode(data).decode()}" width="10" height="10"/>'
+
+
 @pytest.mark.usefixtures("svg_support")
+async def test_large_svg_is_scaled_down(tmp_path):
+    path = tmp_path / "poster.svg"
+    path.write_bytes(svg_document(6000, 4000))
+    (block,) = (await call_fetch([str(path)])).content
+    assert_within_limits(block)
+    assert decode(block).size == (mcp_image.MAX_DIMENSION, round(mcp_image.MAX_DIMENSION * 4000 / 6000))
+
+
 @pytest.mark.usefixtures("svg_support")
 @pytest.mark.parametrize("size", [(20_000, 10_000), (200_000, 200_000)])
-async def test_huge_svg_is_capped_without_rendering_at_full_size(tmp_path, size):
-    w, h = size
+async def test_svgs_declaring_more_than_the_pixel_limit_are_rejected(tmp_path, size):
     path = tmp_path / "poster.svg"
-    path.write_bytes(f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><rect width="{w}" height="{h}" fill="blue"/></svg>'.encode())
+    path.write_bytes(svg_document(*size, defs='<mask id="m"><rect width="100%" height="100%" fill="white"/></mask>'))
     start = time.perf_counter()
     (block,) = (await call_fetch([str(path)])).content
     assert time.perf_counter() - start < 5
-    assert_within_limits(block)
+    assert block.type == "text" and f"SVG declares {size[0]}x{size[1]}px" in block.text
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_slow_svgs_are_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_image, "SVG_RENDER_TIMEOUT", 1)
+    tiles = '<pattern id="p" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="2" height="2"/></pattern>'
+    path = tmp_path / "tiles.svg"
+    path.write_bytes(svg_document(6300, 6300, body='<rect width="100%" height="100%" fill="url(#p)"/>', defs=tiles))
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "took longer than 1s to render" in block.text
+
+
+@pytest.mark.usefixtures("svg_support")
+@pytest.mark.parametrize(
+    "image, message",
+    [
+        (embedded_image(png_with_declared_size(15_000, 15_000)), "an embedded image is over 40 megapixels"),
+        (embedded_image(ICON_SVG, "image/svg+xml"), "embedded images must be PNG, JPEG, GIF, WebP or BMP"),
+        (embedded_image(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n%%EOF\n", "application/postscript"),
+         "embedded images must be PNG, JPEG, GIF, WebP or BMP"),
+    ],
+    ids=["huge-png", "nested-svg", "eps"],
+)
+async def test_embedded_images_are_checked(tmp_path, image, message):
+    path = tmp_path / "embeds.svg"
+    path.write_bytes(svg_document(100, 100, body=image))
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and message in block.text
+
+
+@pytest.mark.usefixtures("svg_support")
+async def test_gzipped_svg_bodies_are_decompressed_within_a_limit(http_server):
+    result = await call_fetch([http_server + "/icon.svgz", http_server + "/bomb.svgz"])
+    assert result.content[0].type == "image"
+    assert "larger than 10 MB once decompressed" in result.content[1].text
 
 
 @pytest.mark.usefixtures("svg_support")
@@ -377,7 +430,7 @@ async def test_svg_cannot_read_other_local_files(tmp_path):
 
 
 async def test_svg_without_extra_explains_how_to_install(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "cairosvg", None)
+    monkeypatch.setattr(mcp_image, "find_spec", lambda name: None)
     path = tmp_path / "icon.svg"
     path.write_bytes(ICON_SVG)
     (block,) = (await call_fetch([str(path)])).content

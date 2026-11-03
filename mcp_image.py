@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 
 import asyncio
-import functools
 import logging
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 import warnings
+import zlib
 from datetime import datetime
 from importlib import metadata
+from importlib.util import find_spec
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit
@@ -20,6 +22,7 @@ import httpx
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from mcp_image_svg import CAIRO_MISSING
 from PIL import Image as PILImage
 from PIL import JpegImagePlugin, UnidentifiedImageError, features
 
@@ -68,7 +71,15 @@ SVG_TARGET_DIMENSION = 1024
 GENERIC_CONTENT_TYPES = {"", "application/octet-stream", "binary/octet-stream", "text/plain", "text/xml", "application/xml"}
 SVG_PROLOG = re.compile(rb"\s*(?:<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>\[]*(?:\[.*?\])?\s*>)", re.DOTALL | re.IGNORECASE)
 SVG_ROOT = re.compile(rb"\s*<(?:[\w.-]+:)?svg[\s/>]", re.IGNORECASE)
+SVG_RENDERER = Path(__file__).with_name("mcp_image_svg.py")
+SVG_RENDER_TIMEOUT = 20.0
+MAX_SVG_BYTES = 10_000_000
+SVG_NOT_INSTALLED = "SVG support is not installed: install the `mcp-image[svg]` extra and the Cairo library"
+NO_CONSOLE_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOWS_GTK3_DIR = r"C:\Program Files\GTK3-Runtime Win64\bin"
+if sys.platform == "win32" and not os.environ.get("CAIROCFFI_DLL_DIRECTORIES") and os.path.isdir(WINDOWS_GTK3_DIR):
+    # Read by cairocffi in the SVG renderer process, which inherits this environment.
+    os.environ["CAIROCFFI_DLL_DIRECTORIES"] = WINDOWS_GTK3_DIR
 
 
 def setup_logging() -> logging.Logger:
@@ -169,44 +180,39 @@ def is_svg(data: bytes, content_type: str) -> bool:
     return SVG_ROOT.match(head, pos) is not None
 
 
-@functools.cache
-def add_windows_cairo_dirs() -> None:
-    """Let cairocffi find a Cairo DLL outside PATH, such as the GTK3 runtime's."""
-    configured = os.environ.get("CAIRO_DLL_DIRS")
-    for directory in configured.split(os.pathsep) if configured else [WINDOWS_GTK3_DIR]:
-        if directory and os.path.isdir(directory):
-            os.add_dll_directory(directory)
-            os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
+def gunzip(data: bytes, limit: int) -> bytes:
+    decompressor = zlib.decompressobj(wbits=31)
+    try:
+        data = decompressor.decompress(data, limit + 1)
+    except zlib.error as e:
+        raise ImageSourceError(f"invalid gzip data ({e})") from None
+    if len(data) > limit:
+        raise ImageSourceError(f"SVG is larger than {limit / 1_000_000:g} MB once decompressed")
+    return data
 
 
 def render_svg(data: bytes, source: str) -> bytes:
-    """Rasterize an SVG to PNG with its longer edge near SVG_TARGET_DIMENSION."""
-    if sys.platform == "win32":
-        add_windows_cairo_dirs()
+    """Rasterize an SVG to PNG, with its longer edge near SVG_TARGET_DIMENSION, in a time-limited process."""
+    if find_spec("cairosvg") is None:
+        raise ImageSourceError(SVG_NOT_INSTALLED)
+    if data.startswith(b"\x1f\x8b"):
+        data = gunzip(data, MAX_SVG_BYTES)
+    if len(data) > MAX_SVG_BYTES:
+        raise ImageSourceError(f"SVG is larger than {MAX_SVG_BYTES / 1_000_000:g} MB")
+    command = [sys.executable, str(SVG_RENDERER), str(MAX_DIMENSION), str(SVG_TARGET_DIMENSION), str(MAX_DECODE_PIXELS)]
     try:
-        import cairosvg
-        from cairosvg.parser import Tree
-        from cairosvg.surface import SVGSurface
-    except (ImportError, OSError) as e:
-        raise ImageSourceError(
-            "SVG support is not installed: install the `mcp-image[svg]` extra and the Cairo library"
-        ) from e
-    try:
-        # Measuring on a vector surface reads the natural size without allocating pixels.
-        # unsafe=False (the default) also stops the SVG from pulling in local files or URLs.
-        surface = SVGSurface(Tree(bytestring=data), None, 96)
-        surface.finish()
-        longest = max(surface.width, surface.height)
-        if longest <= 0:
-            raise ImageSourceError("SVG has no width or height")
-        scale = min(max(longest, SVG_TARGET_DIMENSION), MAX_DIMENSION) / longest
-        png = cairosvg.svg2png(bytestring=data, scale=scale)
-    except ImageSourceError:
-        raise
-    except Exception as e:
-        raise ImageSourceError(f"could not render SVG ({type(e).__name__}: {e})") from e
-    logger.debug("%s: rendered SVG at scale %.4g (%d bytes)", source, scale, len(png))
-    return png
+        result = subprocess.run(
+            command, input=data, capture_output=True, timeout=SVG_RENDER_TIMEOUT, creationflags=NO_CONSOLE_WINDOW
+        )
+    except subprocess.TimeoutExpired:
+        raise ImageSourceError(f"SVG took longer than {SVG_RENDER_TIMEOUT:g}s to render") from None
+    if result.returncode == CAIRO_MISSING:
+        raise ImageSourceError(SVG_NOT_INSTALLED)
+    if result.returncode != 0:
+        lines = result.stderr.decode(errors="replace").strip().splitlines()
+        raise ImageSourceError(f"could not render SVG ({lines[-1] if lines else f'exit status {result.returncode}'})")
+    logger.debug("%s: rendered SVG (%d bytes)", source, len(result.stdout))
+    return result.stdout
 
 
 def has_alpha(img: PILImage.Image) -> bool:
