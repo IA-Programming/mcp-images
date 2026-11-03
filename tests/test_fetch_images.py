@@ -10,7 +10,17 @@ from mcp.client import Client
 from PIL import Image
 
 import mcp_image
-from conftest import ICON_SVG, SMALL_PNG, Handler, call_fetch, decode, make_image, png_with_declared_size, to_bytes
+from conftest import (
+    ICON_SVG,
+    SMALL_PNG,
+    Handler,
+    call_fetch,
+    decode,
+    ico_containing,
+    make_image,
+    png_with_declared_size,
+    to_bytes,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -170,15 +180,45 @@ async def test_images_too_large_to_decode_are_rejected_before_decoding(tmp_path)
     assert block.type == "text" and "megapixels" in block.text
 
 
-async def test_large_jpegs_are_decoded_at_reduced_scale(tmp_path, monkeypatch):
+@pytest.fixture
+def small_decode_limits(monkeypatch):
     monkeypatch.setattr(mcp_image, "MAX_DIMENSION", 500)
     monkeypatch.setattr(mcp_image, "MAX_DECODE_PIXELS", 1_000_000)
+    monkeypatch.setattr(mcp_image.PILImage, "MAX_IMAGE_PIXELS", 500_000)
+
+
+@pytest.mark.usefixtures("small_decode_limits")
+@pytest.mark.parametrize("size", [(4000, 4000), (4000, 500)], ids=["square", "panorama"])
+async def test_large_jpegs_are_decoded_at_reduced_scale(tmp_path, size):
     jpeg, png = tmp_path / "big.jpg", tmp_path / "big.png"
-    jpeg.write_bytes(to_bytes(make_image(size=(4000, 4000)), "JPEG"))
+    jpeg.write_bytes(to_bytes(make_image(size=size), "JPEG"))
     png.write_bytes(to_bytes(make_image(size=(2000, 2000)), "PNG"))
     result = await call_fetch([str(jpeg), str(png)])
     assert [b.type for b in result.content] == ["image", "text"]
     assert max(decode(result.content[0]).size) <= 500
+    assert "too large" in result.content[1].text
+
+
+async def test_huge_images_inside_ico_files_are_rejected(tmp_path):
+    path = tmp_path / "favicon.ico"
+    path.write_bytes(ico_containing(png_with_declared_size(15_000, 15_000)))
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "too large" in block.text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a shell script as a fake Ghostscript")
+async def test_eps_is_not_opened_so_ghostscript_never_runs(tmp_path, monkeypatch):
+    marker = tmp_path / "gs-was-run"
+    fake_gs = tmp_path / "bin" / "gs"
+    fake_gs.parent.mkdir()
+    fake_gs.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    fake_gs.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_gs.parent}{os.pathsep}{os.environ['PATH']}")
+    path = tmp_path / "drawing.eps"
+    path.write_bytes(b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\nnewpath 0 0 moveto 10 10 lineto stroke\n%%EOF\n")
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "not a recognized image" in block.text
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("mode", ["1", "P"])
@@ -222,10 +262,11 @@ async def test_url_variants_return_the_image(http_server, route):
     assert block.type == "image" and block.mime_type == "image/png"
 
 
-async def test_url_sends_user_agent(http_server):
-    Handler.seen_user_agents.clear()
+async def test_url_sends_user_agent_and_accept(http_server):
+    Handler.seen_headers.clear()
     await call_fetch([http_server + "/img.png"])
-    assert Handler.seen_user_agents[-1].startswith("mcp-image/")
+    assert Handler.seen_headers[-1]["User-Agent"].startswith("mcp-image/")
+    assert Handler.seen_headers[-1]["Accept"].startswith("image/png,image/jpeg")
 
 
 @pytest.mark.parametrize(

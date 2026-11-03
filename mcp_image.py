@@ -3,10 +3,12 @@
 import asyncio
 import functools
 import logging
+import math
 import os
 import re
 import sys
 import time
+import warnings
 from datetime import datetime
 from importlib import metadata
 from io import BytesIO
@@ -19,7 +21,7 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from PIL import Image as PILImage
-from PIL import UnidentifiedImageError
+from PIL import JpegImagePlugin, UnidentifiedImageError, features
 
 # Claude downscales anything with a longer edge above 1568px, so larger images only cost bytes.
 MAX_DIMENSION = int(os.environ.get("MCP_IMAGE_MAX_DIMENSION", 1568))
@@ -46,8 +48,15 @@ EXIF_TRANSPOSE = {
     7: PILImage.Transpose.TRANSVERSE,
     8: PILImage.Transpose.ROTATE_90,
 }
-# Replaced by the MAX_DECODE_PIXELS check, which runs after JPEG draft scaling.
-PILImage.MAX_IMAGE_PIXELS = None
+# Pillow refuses images over twice this (= MAX_DECODE_PIXELS) before decoding them, including ones
+# it decodes while opening, such as PNGs inside ICO files. Oversized JPEGs are reopened and drafted.
+PILImage.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS // 2
+warnings.filterwarnings("ignore", category=PILImage.DecompressionBombWarning)
+# Pillow opens dozens of formats, some through external programs (EPS runs Ghostscript), so only
+# the formats photos, screenshots and icons use are allowed.
+OPEN_FORMATS = ("JPEG", "PNG", "GIF", "WEBP", "BMP", "TIFF", "ICO", "PPM", "TGA") + (("AVIF",) if features.check("avif") else ())
+# Servers that negotiate formats should prefer ones LLM clients accept.
+ACCEPT = "image/png,image/jpeg,image/webp,image/gif,image/*;q=0.8,*/*;q=0.5"
 try:
     VERSION = metadata.version("mcp-image")
 except metadata.PackageNotFoundError:
@@ -235,19 +244,30 @@ def encode(img: PILImage.Image, fmt: str, quality: int | None = None) -> bytes:
     return buf.getvalue()
 
 
-def prepare_image(data: bytes, source: str, budget: int, content_type: str = "") -> Image:
-    """Return the image as-is when a client can use it directly, otherwise re-encode it within budget bytes."""
+def open_image(data: bytes, content_type: str) -> PILImage.Image:
     try:
-        img = PILImage.open(BytesIO(data))
+        return PILImage.open(BytesIO(data), formats=OPEN_FORMATS)
     except UnidentifiedImageError:
         detail = f" (Content-Type: {content_type})" if content_type else ""
         raise ImageSourceError(f"not a recognized image{detail}") from None
+    except PILImage.DecompressionBombError:
+        if data.startswith(b"\xff\xd8\xff"):
+            # JPEGs decode at a reduced scale via draft(), which prepare_image checks against the limit.
+            return JpegImagePlugin.JpegImageFile(BytesIO(data))
+        raise ImageSourceError(
+            f"image is too large; at most {MAX_DECODE_PIXELS / 1_000_000:g} megapixels can be decoded"
+        ) from None
 
-    with img:
+
+def prepare_image(data: bytes, source: str, budget: int, content_type: str = "") -> Image:
+    """Return the image as-is when a client can use it directly, otherwise re-encode it within budget bytes."""
+    with open_image(data, content_type) as img:
         fmt, (width, height) = img.format, img.size
         logger.debug("%s: %s %dx%d mode=%s, %d bytes", source, fmt, width, height, img.mode, len(data))
 
-        img.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
+        reduction = MAX_DIMENSION / max(width, height)
+        if reduction < 1:
+            img.draft("RGB", (math.ceil(width * reduction), math.ceil(height * reduction)))
         if img.width * img.height > MAX_DECODE_PIXELS:
             raise ImageSourceError(
                 f"image is {width}x{height}; at most {MAX_DECODE_PIXELS / 1_000_000:g} megapixels can be decoded"
@@ -347,7 +367,7 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
     start = time.perf_counter()
     budget = MAX_TOTAL_BYTES // len(image_sources)
     limit = asyncio.Semaphore(MAX_CONCURRENCY)
-    headers = {"User-Agent": USER_AGENT}
+    headers = {"User-Agent": USER_AGENT, "Accept": ACCEPT}
     async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
         results = await asyncio.gather(
             *(process_source(source, client, budget, limit) for source in image_sources), return_exceptions=True

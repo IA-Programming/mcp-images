@@ -55,6 +55,11 @@ def png_with_declared_size(width, height):
     return bytes(data)
 
 
+def ico_containing(png):
+    """An ICO file with one PNG-compressed entry."""
+    return struct.pack("<HHH", 0, 1, 1) + struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png), 22) + png
+
+
 ICON_SVG = (
     b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12">'
     b'<rect width="24" height="12" fill="#ff0000"/></svg>'
@@ -62,7 +67,7 @@ ICON_SVG = (
 
 
 class Handler(BaseHTTPRequestHandler):
-    seen_user_agents: list[str] = []
+    seen_headers: list[dict] = []
 
     routes = {
         "/img.png": (200, "image/png", SMALL_PNG),
@@ -77,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
     }
 
     def do_GET(self):
-        Handler.seen_user_agents.append(self.headers.get("User-Agent", ""))
+        Handler.seen_headers.append(dict(self.headers))
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/img.png")
