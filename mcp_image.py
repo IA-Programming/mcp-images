@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -194,7 +195,13 @@ def gunzip(data: bytes, limit: int) -> bytes:
     return data
 
 
-def render_svg(data: bytes, source: str) -> bytes:
+def render_svg(
+    data: bytes,
+    source: str,
+    svg_dpi: int | None = None,
+    crop_box: list[int] | None = None,
+    emoji_font_path: str | None = None,
+) -> bytes:
     """Rasterize an SVG to PNG, with its longer edge near SVG_TARGET_DIMENSION, in a time-limited process."""
     if find_spec("cairosvg") is None:
         raise ImageSourceError(SVG_NOT_INSTALLED)
@@ -207,7 +214,14 @@ def render_svg(data: bytes, source: str) -> bytes:
         raise ImageSourceError(f"SVG is larger than {MAX_SVG_BYTES / 1_000_000:g} MB")
     # The CPU limit, enforced by the kernel, stops the renderer even if this server dies mid-render.
     cpu_seconds = math.ceil(SVG_RENDER_TIMEOUT) + 5
-    command = [sys.executable, str(SVG_RENDERER), *map(str, (MAX_DIMENSION, SVG_TARGET_DIMENSION, MAX_DECODE_PIXELS, cpu_seconds))]
+    command = [
+        sys.executable,
+        str(SVG_RENDERER),
+        *map(str, (MAX_DIMENSION, SVG_TARGET_DIMENSION, MAX_DECODE_PIXELS, cpu_seconds)),
+        str(svg_dpi or ""),
+        json.dumps(crop_box) if crop_box is not None else "",
+        str(Path(emoji_font_path).expanduser()) if emoji_font_path else "",
+    ]
     try:
         result = subprocess.run(
             command, input=data, capture_output=True, timeout=SVG_RENDER_TIMEOUT, creationflags=NO_CONSOLE_WINDOW
@@ -300,14 +314,39 @@ def open_image(data: bytes, content_type: str) -> PILImage.Image:
         ) from None
 
 
-def prepare_image(data: bytes, source: str, budget: int, content_type: str = "") -> Image:
+def _normalize_crop_box(crop_box: list[int] | None, image_width: int, image_height: int) -> tuple[int, int, int, int] | None:
+    """Validate a crop box in [x, y, width, height] form and clamp it to the image bounds."""
+    if crop_box is None:
+        return None
+    if len(crop_box) != 4:
+        raise ImageSourceError(f"crop_box must contain four integers [x, y, width, height], got {crop_box}")
+    try:
+        x, y, width, height = (int(value) for value in crop_box)
+    except (TypeError, ValueError) as error:
+        raise ImageSourceError(f"crop_box must contain four integers, got {crop_box}") from error
+    if width <= 0 or height <= 0:
+        raise ImageSourceError(f"crop_box width and height must be positive, got width={width}, height={height}")
+    if x >= image_width or y >= image_height:
+        raise ImageSourceError(f"crop_box origin ({x}, {y}) is outside the {image_width}x{image_height} image")
+    x, y = max(0, x), max(0, y)
+    return x, y, min(width, image_width - x), min(height, image_height - y)
+
+
+def prepare_image(
+    data: bytes,
+    source: str,
+    budget: int,
+    content_type: str = "",
+    crop_box: list[int] | None = None,
+) -> Image:
     """Return the image as-is when a client can use it directly, otherwise re-encode it within budget bytes."""
     with open_image(data, content_type) as img:
         fmt, (width, height) = img.format, img.size
         logger.debug("%s: %s %dx%d mode=%s, %d bytes", source, fmt, width, height, img.mode, len(data))
 
         reduction = MAX_DIMENSION / max(width, height)
-        if reduction < 1:
+        # Crop before downscaling so the requested region retains detail; coordinates always refer to the full display image.
+        if reduction < 1 and crop_box is None:
             img.draft("RGB", (math.ceil(width * reduction), math.ceil(height * reduction)))
         if img.width * img.height > MAX_DECODE_PIXELS:
             raise ImageSourceError(
@@ -316,7 +355,22 @@ def prepare_image(data: bytes, source: str, budget: int, content_type: str = "")
         decode(img)
         orientation = img.getexif().get(ORIENTATION_TAG, 1)
 
-        if fmt in PASSTHROUGH_FORMATS and len(data) <= budget and max(width, height) <= MAX_DIMENSION and orientation == 1:
+        if crop_box is not None:
+            img = to_display_mode(img)
+            if orientation in EXIF_TRANSPOSE:
+                img = img.transpose(EXIF_TRANSPOSE[orientation])
+                orientation = 1
+            normalized = _normalize_crop_box(crop_box, img.width, img.height)
+            x, y, crop_width, crop_height = normalized
+            img = img.crop((x, y, x + crop_width, y + crop_height))
+
+        if (
+            crop_box is None
+            and fmt in PASSTHROUGH_FORMATS
+            and len(data) <= budget
+            and max(width, height) <= MAX_DIMENSION
+            and orientation == 1
+        ):
             logger.info("%s: passed through as %s %dx%d (%d bytes)", source, fmt, width, height, len(data))
             return Image(data=data, format=fmt.lower())
 
@@ -325,16 +379,24 @@ def prepare_image(data: bytes, source: str, budget: int, content_type: str = "")
         if orientation in EXIF_TRANSPOSE:
             img = img.transpose(EXIF_TRANSPOSE[orientation])
 
-        if img.mode == "RGBA" or fmt in LOSSLESS_FORMATS:
+        # Preserve alpha when over budget: keep shrinking transparent PNGs instead of flattening them to JPEG.
+        if img.mode == "RGBA":
+            while True:
+                png = encode(img, "PNG")
+                if len(png) <= budget:
+                    logger.info("%s: %s %dx%d -> PNG %dx%d (%d bytes)", source, fmt, width, height, *img.size, len(png))
+                    return Image(data=png, format="png")
+                new_size = (int(img.width * 0.75), int(img.height * 0.75))
+                if min(new_size) < MIN_DIMENSION:
+                    raise ImageSourceError(f"could not compress below {budget} bytes without dropping under {MIN_DIMENSION}px")
+                logger.debug("%s: transparent PNG still %d bytes, scaling to %dx%d", source, len(png), *new_size)
+                img = img.resize(new_size, PILImage.Resampling.LANCZOS)
+
+        if fmt in LOSSLESS_FORMATS:
             png = encode(img, "PNG")
             if len(png) <= budget:
                 logger.info("%s: %s %dx%d -> PNG %dx%d (%d bytes)", source, fmt, width, height, *img.size, len(png))
                 return Image(data=png, format="png")
-
-        if img.mode == "RGBA":
-            background = PILImage.new("RGB", img.size, "white")
-            background.paste(img, mask=img.getchannel("A"))
-            img = background
 
         while True:
             for quality in JPEG_QUALITIES:
@@ -375,11 +437,24 @@ async def load_source(source: str, client: httpx.AsyncClient) -> tuple[bytes, st
     return await asyncio.to_thread(read_local, source), ""
 
 
-async def process_source(source: str, data: bytes, content_type: str, budget: int) -> Image:
+async def process_source(
+    source: str,
+    data: bytes,
+    content_type: str,
+    budget: int,
+    svg_dpi: int | None = None,
+    crop_box: list[int] | None = None,
+    emoji_font_path: str | None = None,
+) -> Image:
     loop = asyncio.get_running_loop()
     if is_svg(data, content_type):
-        data = await loop.run_in_executor(PROCESSING_POOL, render_svg, data, redact(source))
-    return await loop.run_in_executor(PROCESSING_POOL, prepare_image, data, redact(source), budget, content_type)
+        data = await loop.run_in_executor(
+            PROCESSING_POOL, render_svg, data, redact(source), svg_dpi, crop_box, emoji_font_path
+        )
+        crop_box = None
+    return await loop.run_in_executor(
+        PROCESSING_POOL, prepare_image, data, redact(source), budget, content_type, crop_box
+    )
 
 
 def describe_error(source: str, error: BaseException) -> str:
@@ -403,7 +478,12 @@ def describe_error(source: str, error: BaseException) -> str:
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     structured_output=False,
 )
-async def fetch_images(image_sources: list[str]) -> list[Image | str]:
+async def fetch_images(
+    image_sources: list[str],
+    svg_dpi: int | None = None,
+    emoji_font_path: str | None = None,
+    crop_box: list[int] | None = None,
+) -> list[Image | str]:
     """
     Fetch images from URLs or local file paths and return them so you can see them.
 
@@ -418,6 +498,10 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
     so request fewer images per call when fine detail matters.
     Returns one entry per source, in input order: the image, or a text message explaining why that
     source failed.
+
+    svg_dpi: Optional SVG rendering DPI, clamped to 50-1200; SVGs with explicit pixel dimensions keep pixel semantics.
+    emoji_font_path: Optional emoji font file injected into SVGs; no other external resources are allowed.
+    crop_box: Optional [x, y, width, height] in full-display pixel coordinates, applied before compression.
     """
     if not image_sources:
         raise ToolError("image_sources is empty; provide at least one URL or file path")
@@ -434,7 +518,10 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
     images = await asyncio.to_thread(lambda: sum(looks_like_image(*item) for item in loaded.values()))
     budget = MAX_TOTAL_BYTES // max(1, images)
     processed = await asyncio.gather(
-        *(process_source(image_sources[i], data, content_type, budget) for i, (data, content_type) in loaded.items()),
+        *(
+            process_source(image_sources[i], data, content_type, budget, svg_dpi, crop_box, emoji_font_path)
+            for i, (data, content_type) in loaded.items()
+        ),
         return_exceptions=True,
     )
     for i, result in zip(loaded, processed):
