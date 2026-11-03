@@ -258,6 +258,33 @@ def encode(img: PILImage.Image, fmt: str, quality: int | None = None) -> bytes:
     return buf.getvalue()
 
 
+def jpeg_is_single_scan(data: bytes) -> bool:
+    """True for a sequential JPEG whose first scan covers every component.
+
+    libjpeg buffers coefficients for the whole image for any other JPEG (progressive, or components
+    in separate scans), however small the draft size.
+    """
+    pos, components = 2, None
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            return False
+        marker = data[pos + 1]
+        if marker == 0xFF:
+            pos += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            pos += 2
+            continue
+        if marker in (0xC0, 0xC1):
+            components = data[pos + 9] if pos + 9 < len(data) else None
+        elif 0xC2 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return False
+        elif marker == 0xDA:
+            return components is not None and data[pos + 4] == components
+        pos += 2 + int.from_bytes(data[pos + 2 : pos + 4], "big")
+    return False
+
+
 def open_image(data: bytes, content_type: str) -> PILImage.Image:
     try:
         return PILImage.open(BytesIO(data), formats=OPEN_FORMATS)
@@ -265,13 +292,9 @@ def open_image(data: bytes, content_type: str) -> PILImage.Image:
         detail = f" (Content-Type: {content_type})" if content_type else ""
         raise ImageSourceError(f"not a recognized image{detail}") from None
     except PILImage.DecompressionBombError:
-        if data.startswith(b"\xff\xd8\xff"):
-            # Baseline JPEGs decode at a reduced scale via draft(), which prepare_image checks against
-            # the limit. Progressive ones still buffer coefficients for the full image, so they can't.
-            img = JpegImagePlugin.JpegImageFile(BytesIO(data))
-            if not img.info.get("progressive"):
-                return img
-            img.close()
+        if data.startswith(b"\xff\xd8\xff") and jpeg_is_single_scan(data):
+            # These decode at a reduced scale via draft(), which prepare_image checks against the limit.
+            return JpegImagePlugin.JpegImageFile(BytesIO(data))
         raise ImageSourceError(
             f"image is too large; at most {MAX_DECODE_PIXELS / 1_000_000:g} megapixels can be decoded"
         ) from None
@@ -330,8 +353,12 @@ def prepare_image(data: bytes, source: str, budget: int, content_type: str = "")
 
 
 def looks_like_image(data: bytes, content_type: str) -> bool:
-    """Cheap header check used to share the size budget only among sources that will become images."""
-    if is_svg(data, content_type):
+    """Cheap header check used to share the size budget only among sources that will become images.
+
+    It may over-count (wasting budget) but must not under-count, or the total could exceed it.
+    """
+    # Pillow decodes the embedded image while opening an ICO, so go by its signature instead.
+    if is_svg(data, content_type) or data.startswith(b"\x00\x00\x01\x00"):
         return True
     try:
         with PILImage.open(BytesIO(data), formats=OPEN_FORMATS):

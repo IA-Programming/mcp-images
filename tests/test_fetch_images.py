@@ -236,11 +236,30 @@ async def test_large_jpegs_are_decoded_at_reduced_scale(tmp_path, size):
 
 
 @pytest.mark.usefixtures("small_decode_limits")
-async def test_large_progressive_jpegs_are_rejected(tmp_path):
-    path = tmp_path / "progressive.jpg"
-    path.write_bytes(to_bytes(make_image(size=(4000, 4000)), "JPEG", progressive=True))
+@pytest.mark.parametrize("kind", ["progressive", "separate-scans"])
+async def test_large_multi_scan_jpegs_are_rejected(tmp_path, kind):
+    data = to_bytes(make_image(size=(4000, 4000)), "JPEG", progressive=kind == "progressive")
+    if kind == "separate-scans":
+        data = bytearray(data)
+        data[data.index(b"\xff\xda") + 4] = 1  # first scan claims 1 of 3 components
+    path = tmp_path / "multi-scan.jpg"
+    path.write_bytes(bytes(data))
     (block,) = (await call_fetch([str(path)])).content
     assert block.type == "text" and "too large" in block.text
+
+
+@pytest.mark.parametrize("mode", ["RGB", "L", "CMYK"])
+def test_baseline_jpegs_are_single_scan(mode):
+    assert mcp_image.jpeg_is_single_scan(to_bytes(make_image(mode, color=None), "JPEG"))
+    assert not mcp_image.jpeg_is_single_scan(to_bytes(make_image(mode, color=None), "JPEG", progressive=True))
+
+
+def test_icos_count_toward_the_budget_without_being_decoded(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("ICO was opened")
+
+    monkeypatch.setattr(mcp_image.PILImage, "open", fail)
+    assert mcp_image.looks_like_image(ico_containing(SMALL_PNG), "")
 
 
 async def test_huge_images_inside_ico_files_are_rejected(tmp_path):

@@ -121,7 +121,7 @@ Parameters:
 
 Returns one entry per source, in the same order: the image, or a text message explaining why that source failed (for example `Error processing /tmp/a.png: file not found: /tmp/a.png`).
 
-Limits per call: 20 sources, 50 MB per file or download, 30 seconds per download, and 40 megapixels per decoded image (large JPEGs are decoded at a reduced scale, so camera photos are fine). SVGs are rendered in a separate process and must declare at most 40 megapixels, be at most 10 MB (after decompressing gzip), and render within 10 seconds; they can only embed PNG, JPEG, GIF, WebP or BMP images as `data:` URLs. On Linux the renderer is also limited to 1.5 GB of memory, and on Linux and macOS to 15 seconds of CPU time even if the server exits mid-render; Windows has neither limit, only the 10-second timeout.
+Limits per call: 20 sources, 50 MB per file or download, 30 seconds per download, and 40 megapixels per decoded image (large JPEGs are decoded at a reduced scale, so camera photos are fine). SVGs are rendered in a separate process and must declare at most 40 megapixels, be at most 10 MB (after decompressing gzip), and render within 10 seconds; they can only embed PNG, JPEG, GIF, WebP or BMP images as `data:` URLs. On Linux the renderer is also limited to 1.5 GB of memory, and on Linux and macOS to 15 seconds of CPU time even if the server exits mid-render. Windows has neither limit: there the 10-second timeout only applies while the server is running, so a renderer can outlive a server that is killed mid-render.
 
 ### Usage Examples
 - "Fetch these images: [list of URLs or file paths]"
