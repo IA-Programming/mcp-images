@@ -8,6 +8,7 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=2.3.0,<3",
+    "packaging>=23.0",
     "pillow>=13.0.0",
 ]
 
@@ -18,13 +19,16 @@ mcp-image = "mcp_image:main"
 svg = [
     "cairosvg>=2.9.1",
 ]
+pdf = [
+    "pymupdf>=1.24.0,<1.27",
+]
 
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["mcp_image", "mcp_image_svg"]
+py-modules = ["mcp_image", "mcp_image_svg", "pdf_support"]
 
 [dependency-groups]
 dev = [
