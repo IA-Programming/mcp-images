@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -169,11 +171,13 @@ async def test_images_in_one_call_share_the_size_budget(tmp_path):
     assert sum(sizes) <= mcp_image.MAX_TOTAL_BYTES
 
 
-async def test_failed_sources_leave_their_budget_to_the_others(tmp_path):
+@pytest.mark.parametrize("other", ["missing.png", "notes.txt"])
+async def test_failed_and_non_image_sources_leave_their_budget_to_the_others(tmp_path, other):
     path = tmp_path / "big.jpg"
     path.write_bytes(to_bytes(make_image(size=(3000, 2000), noise=True), "JPEG", quality=95))
-    photo, missing = (await call_fetch([str(path), str(tmp_path / "missing.png")])).content
-    assert missing.type == "text"
+    (tmp_path / "notes.txt").write_text("not an image")
+    photo, failed = (await call_fetch([str(path), str(tmp_path / other)])).content
+    assert failed.type == "text"
     assert mcp_image.MAX_TOTAL_BYTES // 2 < len(base64.b64decode(photo.data)) <= mcp_image.MAX_TOTAL_BYTES
 
 
@@ -229,6 +233,14 @@ async def test_large_jpegs_are_decoded_at_reduced_scale(tmp_path, size):
     assert [b.type for b in result.content] == ["image", "text"]
     assert max(decode(result.content[0]).size) <= 500
     assert "too large" in result.content[1].text
+
+
+@pytest.mark.usefixtures("small_decode_limits")
+async def test_large_progressive_jpegs_are_rejected(tmp_path):
+    path = tmp_path / "progressive.jpg"
+    path.write_bytes(to_bytes(make_image(size=(4000, 4000)), "JPEG", progressive=True))
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "too large" in block.text
 
 
 async def test_huge_images_inside_ico_files_are_rejected(tmp_path):
@@ -411,9 +423,43 @@ async def test_embedded_images_are_checked(tmp_path, image, message):
 
 @pytest.mark.usefixtures("svg_support")
 async def test_gzipped_svg_bodies_are_decompressed_within_a_limit(http_server):
-    result = await call_fetch([http_server + "/icon.svgz", http_server + "/bomb.svgz"])
+    result = await call_fetch([http_server + "/icon.svgz", http_server + "/bomb.svgz", http_server + "/twice.svgz"])
     assert result.content[0].type == "image"
     assert "larger than 10 MB once decompressed" in result.content[1].text
+    assert "compressed more than once" in result.content[2].text
+
+
+@pytest.mark.usefixtures("svg_support")
+@pytest.mark.skipif(sys.platform != "linux", reason="the renderer's memory limit is only enforced on Linux")
+@pytest.mark.parametrize(
+    "svg",
+    [
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 20000 20000">'
+        b'<defs><mask id="m"><rect width="100%" height="100%" fill="white"/></mask></defs>'
+        b'<rect width="20000" height="20000" fill="red" mask="url(#m)"/></svg>',
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><svg width="20000" height="20000">'
+        b'<defs><mask id="m"><rect width="100%" height="100%" fill="white"/></mask></defs>'
+        b'<rect width="20000" height="20000" fill="red" mask="url(#m)"/></svg></svg>',
+    ],
+    ids=["viewbox", "nested-svg"],
+)
+async def test_svgs_needing_too_much_memory_are_stopped(tmp_path, svg):
+    path = tmp_path / "hungry.svg"
+    path.write_bytes(svg)
+    (block,) = (await call_fetch([str(path)])).content
+    assert block.type == "text" and "needs more than 1.5 GB of memory" in block.text
+
+
+@pytest.mark.usefixtures("svg_support")
+@pytest.mark.skipif(sys.platform == "win32", reason="CPU limits are POSIX only")
+def test_renderer_stops_itself_without_its_parent():
+    tiles = '<pattern id="p" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="2" height="2"/></pattern>'
+    svg = svg_document(6300, 6300, body='<rect width="100%" height="100%" fill="url(#p)"/>', defs=tiles)
+    renderer = [sys.executable, str(mcp_image.SVG_RENDERER), "1568", "1024", "40000000", "1"]
+    start = time.perf_counter()
+    result = subprocess.run(renderer, input=svg, capture_output=True, timeout=60)
+    assert result.returncode in (-signal.SIGXCPU, -signal.SIGKILL)
+    assert time.perf_counter() - start < 10
 
 
 @pytest.mark.usefixtures("svg_support")

@@ -81,6 +81,7 @@ class Handler(BaseHTTPRequestHandler):
         "/icon-as-text": (200, "text/plain", ICON_SVG),
         "/icon.svgz": (200, "image/svg+xml", gzip.compress(ICON_SVG)),
         "/bomb.svgz": (200, "image/svg+xml", gzip.compress(b"<svg>" + b" " * 11_000_000 + b"</svg>")),
+        "/twice.svgz": (200, "image/svg+xml", gzip.compress(gzip.compress(ICON_SVG))),
         "/page-with-svg": (200, "text/html", b"<!doctype html><html><body>" + ICON_SVG + b"</body></html>"),
     }
 

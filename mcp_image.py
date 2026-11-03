@@ -75,7 +75,7 @@ GENERIC_CONTENT_TYPES = {"", "application/octet-stream", "binary/octet-stream", 
 SVG_PROLOG = re.compile(rb"\s*(?:<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>\[]*(?:\[.*?\])?\s*>)", re.DOTALL | re.IGNORECASE)
 SVG_ROOT = re.compile(rb"\s*<(?:[\w.-]+:)?svg[\s/>]", re.IGNORECASE)
 SVG_RENDERER = Path(__file__).with_name("mcp_image_svg.py")
-SVG_RENDER_TIMEOUT = 20.0
+SVG_RENDER_TIMEOUT = 10.0
 MAX_SVG_BYTES = 10_000_000
 SVG_NOT_INSTALLED = "SVG support is not installed: install the `mcp-image[svg]` extra and the Cairo library"
 NO_CONSOLE_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -200,9 +200,14 @@ def render_svg(data: bytes, source: str) -> bytes:
         raise ImageSourceError(SVG_NOT_INSTALLED)
     if data.startswith(b"\x1f\x8b"):
         data = gunzip(data, MAX_SVG_BYTES)
+        if data.startswith(b"\x1f\x8b"):
+            # cairosvg would inflate a second layer without any limit.
+            raise ImageSourceError("SVG is compressed more than once")
     if len(data) > MAX_SVG_BYTES:
         raise ImageSourceError(f"SVG is larger than {MAX_SVG_BYTES / 1_000_000:g} MB")
-    command = [sys.executable, str(SVG_RENDERER), str(MAX_DIMENSION), str(SVG_TARGET_DIMENSION), str(MAX_DECODE_PIXELS)]
+    # The CPU limit, enforced by the kernel, stops the renderer even if this server dies mid-render.
+    cpu_seconds = math.ceil(SVG_RENDER_TIMEOUT) + 5
+    command = [sys.executable, str(SVG_RENDERER), *map(str, (MAX_DIMENSION, SVG_TARGET_DIMENSION, MAX_DECODE_PIXELS, cpu_seconds))]
     try:
         result = subprocess.run(
             command, input=data, capture_output=True, timeout=SVG_RENDER_TIMEOUT, creationflags=NO_CONSOLE_WINDOW
@@ -261,8 +266,12 @@ def open_image(data: bytes, content_type: str) -> PILImage.Image:
         raise ImageSourceError(f"not a recognized image{detail}") from None
     except PILImage.DecompressionBombError:
         if data.startswith(b"\xff\xd8\xff"):
-            # JPEGs decode at a reduced scale via draft(), which prepare_image checks against the limit.
-            return JpegImagePlugin.JpegImageFile(BytesIO(data))
+            # Baseline JPEGs decode at a reduced scale via draft(), which prepare_image checks against
+            # the limit. Progressive ones still buffer coefficients for the full image, so they can't.
+            img = JpegImagePlugin.JpegImageFile(BytesIO(data))
+            if not img.info.get("progressive"):
+                return img
+            img.close()
         raise ImageSourceError(
             f"image is too large; at most {MAX_DECODE_PIXELS / 1_000_000:g} megapixels can be decoded"
         ) from None
@@ -318,6 +327,19 @@ def prepare_image(data: bytes, source: str, budget: int, content_type: str = "")
                 raise ImageSourceError(f"could not compress below {budget} bytes without dropping under {MIN_DIMENSION}px")
             logger.debug("%s: still %d bytes at q=%d, scaling to %dx%d", source, len(jpeg), quality, *new_size)
             img = img.resize(new_size, PILImage.Resampling.LANCZOS)
+
+
+def looks_like_image(data: bytes, content_type: str) -> bool:
+    """Cheap header check used to share the size budget only among sources that will become images."""
+    if is_svg(data, content_type):
+        return True
+    try:
+        with PILImage.open(BytesIO(data), formats=OPEN_FORMATS):
+            return True
+    except PILImage.DecompressionBombError:
+        return data.startswith(b"\xff\xd8\xff")
+    except Exception:
+        return False
 
 
 async def load_source(source: str, client: httpx.AsyncClient) -> tuple[bytes, str]:
@@ -380,9 +402,10 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
     async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
         results = await asyncio.gather(*(load_source(source, client) for source in image_sources), return_exceptions=True)
 
-    # Sources that failed to load leave their share of the size budget to the others.
+    # Sources that failed to load or are not images leave their share of the size budget to the others.
     loaded = {i: item for i, item in enumerate(results) if not isinstance(item, BaseException)}
-    budget = MAX_TOTAL_BYTES // max(1, len(loaded))
+    images = await asyncio.to_thread(lambda: sum(looks_like_image(*item) for item in loaded.values()))
+    budget = MAX_TOTAL_BYTES // max(1, images)
     processed = await asyncio.gather(
         *(process_source(image_sources[i], data, content_type, budget) for i, (data, content_type) in loaded.items()),
         return_exceptions=True,
