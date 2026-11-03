@@ -24,7 +24,7 @@ Your contributions go a long way in fueling our passion for creating intelligent
 ## Features
 - Fetch images from `http(s)` URLs (redirects followed) and local paths, including `~/...` and `file://` URIs
 - Detects the real format from the file contents, so wrong extensions and `application/octet-stream` responses (e.g. Telegram's file API) still work
-- Returns JPEG, PNG, GIF and WebP as-is when they are small enough; converts everything else (BMP, TIFF, ...) to PNG or JPEG
+- Reads JPEG, PNG, GIF, WebP, BMP, TIFF, ICO, PPM, TGA and AVIF; returns JPEG, PNG, GIF and WebP as-is when they are small enough and converts the rest to PNG or JPEG. Other formats are refused (EPS, for instance, would run Ghostscript)
 - Downscales to 1568px on the longer edge; all images in one call share a ~700 KB budget (about 930 KB once base64-encoded), under the ~1 MB tool-result limit Claude Desktop is reported to enforce
 - Keeps transparency (PNG) when possible, applies EXIF rotation, and converts palette, 1-bit and 16-bit images without losing their tones
 - Optional SVG support: small icons are rendered large enough to read, and an SVG cannot pull in other local files or URLs
@@ -36,7 +36,7 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - For SVG support only: the native Cairo library
   - Debian/Ubuntu: `sudo apt install libcairo2`
   - macOS: `brew install cairo` (on Apple Silicon, also set `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` for the server)
-  - Windows: install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer). Its default folder (`C:\Program Files\GTK3-Runtime Win64\bin`) is found automatically; for another location, or another app that bundles `libcairo-2.dll`, set `CAIRO_DLL_DIRS` to that folder
+  - Windows: install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer). Its default folder (`C:\Program Files\GTK3-Runtime Win64\bin`) is found automatically; for another location, or another app that bundles `libcairo-2.dll`, set `CAIROCFFI_DLL_DIRECTORIES` to that folder
 
 ## Installation
 ```bash
@@ -121,7 +121,7 @@ Parameters:
 
 Returns one entry per source, in the same order: the image, or a text message explaining why that source failed (for example `Error processing /tmp/a.png: file not found: /tmp/a.png`).
 
-Limits per call: 20 sources, 50 MB per file or download, 30 seconds per download, and 40 megapixels per decoded image (large JPEGs are decoded at a reduced scale, so camera photos are fine).
+Limits per call: 20 sources, 50 MB per file or download, 30 seconds per download, and 40 megapixels per decoded image (large JPEGs are decoded at a reduced scale, so camera photos are fine). SVGs are rendered in a separate process and must declare at most 40 megapixels, be at most 10 MB (after decompressing gzip), and render within 20 seconds; they can only embed PNG, JPEG, GIF, WebP or BMP images as `data:` URLs.
 
 ### Usage Examples
 - "Fetch these images: [list of URLs or file paths]"
@@ -145,7 +145,7 @@ Optional environment variables:
 | `MCP_IMAGE_MAX_TOTAL_BYTES` | `700000` | Size budget shared by all images in one call, before base64 encoding |
 | `MCP_IMAGE_LOG_LEVEL` | `INFO` | Level of the logs written to stderr (`DEBUG` for details) |
 | `MCP_IMAGE_LOG_DIR` | unset | Folder for a detailed debug log file; no file is written when unset |
-| `CAIRO_DLL_DIRS` | unset | Windows only: folders (separated by `;`) containing `libcairo-2.dll` |
+| `CAIROCFFI_DLL_DIRECTORIES` | GTK3 runtime folder, if installed | Windows only, read by cairocffi: folders (separated by `;`) containing `libcairo-2.dll` |
 
 ## Testing and Debugging
 Run the test suite:
