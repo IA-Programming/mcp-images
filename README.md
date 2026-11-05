@@ -5,7 +5,7 @@ A Model Context Protocol (MCP) server that lets an AI assistant look at images. 
 
 If you find this project helpful and would like to support future projects, consider buying us a coffee! Your support helps us continue building innovative AI solutions.
 
-<a href="https://www.buymeacoffee.com/blazzmocompany"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=&slug=blazzmocompany&button_colour=40DCA5&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00"></a>
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-40DCA5?style=for-the-badge&logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/blazzmocompany)
 
 Your contributions go a long way in fueling our passion for creating intelligent and user-friendly applications.
 
