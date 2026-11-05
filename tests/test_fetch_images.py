@@ -38,9 +38,9 @@ def assert_within_limits(block):
 
 async def test_tool_is_listed_with_read_only_hint():
     async with Client(mcp_image.mcp) as client:
-        (tool,) = (await client.list_tools()).tools
+        tools = (await client.list_tools()).tools
         version = client.server_info.version
-    assert tool.name == "fetch_images"
+    tool = next(tool for tool in tools if tool.name == "fetch_images")
     assert tool.annotations.read_only_hint is True
     assert version == mcp_image.VERSION != "0+unknown"
 

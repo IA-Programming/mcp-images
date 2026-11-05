@@ -27,6 +27,8 @@ from mcp_image_svg import CAIRO_MISSING
 from PIL import Image as PILImage
 from PIL import JpegImagePlugin, UnidentifiedImageError, features
 
+import pdf_support
+
 # Claude downscales anything with a longer edge above 1568px, so larger images only cost bytes.
 MAX_DIMENSION = int(os.environ.get("MCP_IMAGE_MAX_DIMENSION", 1568))
 # Claude Desktop reportedly rejects tool results over ~1 MB and base64 adds a third, so all images
@@ -450,6 +452,77 @@ async def fetch_images(image_sources: list[str]) -> list[Image | str]:
     ok = sum(isinstance(r, Image) for r in output)
     logger.info("Processed %d sources in %.2fs: %d ok, %d failed", len(output), time.perf_counter() - start, ok, len(output) - ok)
     return output
+
+
+@mcp.tool(
+    title="PDF to images",
+    annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+    structured_output=False,
+)
+async def pdf_to_images(
+    pdf_path: str,
+    pages: list[int] | None = None,
+    dpi: int | None = None,
+) -> list[Image | str] | str:
+    """Render selected pages of a local PDF to images, or return only its page count when pages is omitted.
+
+    pdf_path: Local PDF path or file:// URI.
+    pages: One-based page numbers in any order; results preserve the requested order. Omit to return only the page count.
+    dpi: Optional rendering resolution, clamped to 50-1200 and defaulting to 150.
+    On first use without PyMuPDF, a compatible wheel is downloaded and installed through a multi-source race.
+    """
+    actual_dpi = 150 if dpi is None else max(50, min(int(dpi), 1200))
+    if pages is not None and len(pages) > MAX_SOURCES:
+        raise ToolError(f"At most {MAX_SOURCES} pages can be converted per call; split the request into batches")
+    if pages == []:
+        return []
+    if not pdf_path:
+        return ["PDF file path is required"]
+
+    loop = asyncio.get_running_loop()
+    try:
+        path = resolve_local_path(pdf_path)
+        if pages is None:
+            page_count = await loop.run_in_executor(
+                PROCESSING_POOL, pdf_support.get_pdf_page_count, str(path), MAX_SOURCE_BYTES
+            )
+            if page_count <= 0:
+                return f"This PDF has no pages: {path}"
+            example_pages = list(range(1, min(3, page_count) + 1))
+            return (
+                f"No pages were specified, so no pages were rendered. This PDF has {page_count} pages "
+                f"(valid page numbers: 1-{page_count}). Pass `pages` to render specific pages, for example {example_pages}."
+            )
+    except Exception as error:
+        logger.exception("Failed to read the PDF page count")
+        return [f"PDF conversion failed: {error}"]
+
+    page_budget = MAX_TOTAL_BYTES // max(1, len(pages))
+
+    async def convert_page(page_number: int) -> Image | str:
+        try:
+            image_bytes = await loop.run_in_executor(
+                PROCESSING_POOL,
+                pdf_support.render_pdf_page,
+                str(path),
+                page_number,
+                actual_dpi,
+                MAX_DECODE_PIXELS,
+                MAX_SOURCE_BYTES,
+            )
+            return await loop.run_in_executor(
+                PROCESSING_POOL,
+                prepare_image,
+                image_bytes,
+                f"{path} page {page_number}",
+                page_budget,
+                "",
+            )
+        except Exception as error:
+            logger.warning("Failed to convert PDF page %s: %s", page_number, error)
+            return f"Failed to convert page {page_number}: {error}"
+
+    return await asyncio.gather(*(convert_page(page_number) for page_number in pages))
 
 
 def main():

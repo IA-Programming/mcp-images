@@ -28,6 +28,7 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - Downscales to 1568px on the longer edge; all images in one call share a ~700 KB budget (about 930 KB once base64-encoded), under the ~1 MB tool-result limit Claude Desktop is reported to enforce
 - Keeps transparency (PNG) when possible, applies EXIF rotation, and converts palette, 1-bit and 16-bit images without losing their tones
 - Optional SVG support: small icons are rendered large enough to read, and an SVG cannot pull in other local files or URLs
+- PDF rendering: query only the page count or render pages in a specified order; PyMuPDF is installed on first use through a multi-source download race
 - Processes up to 20 sources per call in parallel; a failed source returns a message saying why, in its position in the list
 
 ## Prerequisites
@@ -122,6 +123,14 @@ Parameters:
 Returns one entry per source, in the same order: the image, or a text message explaining why that source failed (for example `Error processing /tmp/a.png: file not found: /tmp/a.png`).
 
 Limits per call: 20 sources, 50 MB per file or download, 30 seconds per download, and 40 megapixels per decoded image (large JPEGs are decoded at a reduced scale, so camera photos are fine). SVGs are rendered in a separate process and must declare at most 40 megapixels, be at most 10 MB (after decompressing gzip), and render within 10 seconds; they can only embed PNG, JPEG, GIF, WebP or BMP images as `data:` URLs. On Linux the renderer is also limited to 1.5 GB of memory, and on Linux and macOS to 15 seconds of CPU time even if the server exits mid-render. Windows has neither limit: there the 10-second timeout only applies while the server is running, so a renderer can outlive a server that is killed mid-render.
+
+**pdf_to_images**: render pages from a local PDF to images.
+
+- `pdf_path` (required): local PDF path or `file://` URI.
+- `pages` (optional): one-based page numbers; when omitted, only the total page count is returned and no pages are rendered.
+- `dpi` (optional): rendering resolution, defaulting to 150 and clamped to 50-1200.
+- Results preserve the requested page order, a failure on one page does not affect the others, and each batch is limited to 20 pages sharing the image-size budget.
+- PyMuPDF is installed on first use when missing; it can also be installed in advance with the project's `pdf` extra.
 
 ### Usage Examples
 - "Fetch these images: [list of URLs or file paths]"
