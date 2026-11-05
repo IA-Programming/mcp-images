@@ -26,8 +26,8 @@ Your contributions go a long way in fueling our passion for creating intelligent
 - Detects the real format from the file contents, so wrong extensions and `application/octet-stream` responses (e.g. Telegram's file API) still work
 - Reads JPEG, PNG, GIF, WebP, BMP, TIFF, ICO, PPM, TGA and AVIF; returns JPEG, PNG, GIF and WebP as-is when they are small enough and converts the rest to PNG or JPEG. Other formats are refused (EPS, for instance, would run Ghostscript)
 - Downscales to 1568px on the longer edge; all images in one call share a ~700 KB budget (about 930 KB once base64-encoded), under the ~1 MB tool-result limit Claude Desktop is reported to enforce
-- Keeps transparency (PNG) when possible, applies EXIF rotation, and converts palette, 1-bit and 16-bit images without losing their tones
-- Optional SVG support: small icons are rendered large enough to read, and an SVG cannot pull in other local files or URLs
+- Always preserves alpha channels: oversized transparent PNGs are scaled down instead of being flattened onto white or converted to JPEG; EXIF rotation and cropping in full-display coordinates are also supported
+- Optional SVG support: small icons are rendered large enough to read, custom DPI and vector cropping are available, and an SVG cannot pull in other local files or URLs
 - Processes up to 20 sources per call in parallel; a failed source returns a message saying why, in its position in the list
 
 ## Prerequisites
@@ -118,6 +118,9 @@ Add to your user or workspace `mcp.json`:
 
 Parameters:
 - `image_sources` (required): list of URLs or file paths. For one image, pass a one-element list.
+- `svg_dpi` (optional): SVG rendering DPI, clamped to 50-1200; automatic sizing is used when omitted.
+- `emoji_font_path` (optional): emoji font file injected into SVGs.
+- `crop_box` (optional): `[x, y, width, height]` in full-display pixel coordinates; out-of-bounds areas are clamped, and cropping happens before compression.
 
 Returns one entry per source, in the same order: the image, or a text message explaining why that source failed (for example `Error processing /tmp/a.png: file not found: /tmp/a.png`).
 

@@ -87,15 +87,15 @@ async def test_oversized_transparent_png_keeps_alpha(tmp_path):
     assert img.mode == "RGBA" and img.getpixel((0, 0))[3] == 0
 
 
-async def test_transparency_flattens_to_white_when_jpeg_is_needed(tmp_path):
+async def test_transparency_is_preserved_when_jpeg_would_be_smaller(tmp_path):
     img = make_image("RGBA", (2000, 2000), noise=True)
     img.paste((0, 0, 0, 0), (0, 0, 400, 400))
     path = tmp_path / "noisy.png"
     path.write_bytes(to_bytes(img, "PNG"))
     (block,) = (await call_fetch([str(path)])).content
     assert_within_limits(block)
-    assert block.mime_type == "image/jpeg"
-    assert min(decode(block).convert("RGB").getpixel((5, 5))) > 240
+    assert block.mime_type == "image/png"
+    assert decode(block).getpixel((5, 5))[3] == 0
 
 
 @pytest.mark.parametrize("fmt, ext", [("BMP", "bmp"), ("TIFF", "tiff")])
